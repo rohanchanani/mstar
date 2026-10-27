@@ -33,9 +33,13 @@ class BucketKey:
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
 
+    # Distinct physical programs may capture the same logical shape.
+    execution_name: str | None = None
+
     def __str__(self) -> str:
         key = "" if self.cg_key_info is None else f",key={self.cg_key_info}"
-        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}]"
+        program = "" if self.execution_name is None else f",execution={self.execution_name}"
+        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}{program}]"
 
 
 @dataclass(frozen=True)
@@ -187,6 +191,11 @@ class RequestOffloading(AdmitFailedReason):
     """
     label: str
     request_id: str
+
+@dataclass
+class ExecutionBusy(AdmitFailedReason):
+    """A supported execution has no free workspace; retry without state effects."""
+
 
 @dataclass
 class AdmitRuntimeError(AdmitFailedReason):

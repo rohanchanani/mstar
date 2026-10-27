@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
@@ -7,9 +11,10 @@ from mstar.engine.resources.attn.ragged.base import (
     RaggedCrossAttnManager,
 )
 from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
+if TYPE_CHECKING:
+    from mstar.engine.resources.linear_attn.base import LinearAttnManager
 
 class AttentionCallable:
     """A convenience wrapper around kv and attn that wraps the KV write and
