@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from mstar.engine.engine import Engine  # noqa: E402
+from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement  # noqa: E402
 
 
 class _Batch:
@@ -24,6 +24,8 @@ class _Batch:
         self.final_stream_rids = set()
         self.skipped_rids = set()
         self.failed_requests = {}
+        self.prepared_rows = {}
+        self.physical_inputs = {}
         self.inputs = None
         self.running_batched = None
         self.rows_only = False
@@ -61,7 +63,7 @@ class _Sub:
 
 def _engine(sub):
     eng = Engine.__new__(Engine)
-    eng._submodules = {"llm": SimpleNamespace(submodule=sub, resources={})}
+    eng._submodules = {"llm": SubmoduleManagement(sub, None, None, None, {})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     return eng
@@ -118,3 +120,55 @@ def test_a_mixed_step_records_loopback_under_each_row_s_own_walk():
     eng._record_loopback(mixed)
     eng.prepare_inputs(_Batch([1, 2, 3]))
     assert sub.row_loopback == [True, True, False]
+
+
+@pytest.mark.parametrize("prefix_consumed", [False, True])
+def test_physical_preparation_finishes_only_surviving_logical_rows(prefix_consumed):
+    from mstar.engine.resources import StepContext
+    from mstar.model.submodule_base import NodeInputs
+
+    events = []
+    logical = NodeInputs(input_seq_len=1)
+    physical = NodeInputs(input_seq_len=1)
+
+    class Preparation:
+        def finish(self, inputs):
+            assert inputs is logical
+            events.append("physical")
+            return physical
+
+    sub = _Sub()
+
+    def prepare_inputs(**kwargs):
+        assert isinstance(kwargs["preparation"], Preparation)
+        events.append("logical")
+        return logical
+
+    sub.prepare_inputs = prepare_inputs
+    eng = _engine(sub)
+    eng._keyed_walks = {"llm": {"decode"}}
+    eng._submodules["llm"].tensor_program = SimpleNamespace(
+        program=SimpleNamespace(input_preparation=Preparation),
+        can_batch=lambda batch, inputs: bool(inputs),
+    )
+
+    def skip_prefix(batch, rid, inputs):
+        events.append("prefix")
+        return None if prefix_consumed else inputs
+
+    eng._skip_cached_prefix = skip_prefix
+    batch = ExecutingBatch("llm", {1: SimpleNamespace()}, StepContext((1,), "decode", slot=0, capture=False))
+    eng.prepare_inputs(batch)
+    assert not batch.failed_requests
+    if prefix_consumed:
+        assert events == ["logical", "prefix"]
+        assert batch.request_ids == [] and batch.physical_inputs == {}
+    else:
+        assert events == ["logical", "prefix", "physical"]
+        retained = batch.retain_rows({1})
+        assert retained[1].inputs is logical and retained[1].physical_inputs is physical
+        retry = ExecutingBatch("llm", batch.per_request_info, StepContext((1,), "decode", slot=0, capture=False),
+                               prepared_rows=retained)
+        eng.prepare_inputs(retry)
+        assert events == ["logical", "prefix", "physical"]
+        assert retry.inputs == [logical] and retry.physical_inputs == {1: physical}

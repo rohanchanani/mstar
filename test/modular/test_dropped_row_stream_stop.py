@@ -21,7 +21,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
+from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
@@ -87,7 +87,7 @@ class _Runtime:
 
 def _engine(sub):
     eng = Engine.__new__(Engine)
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub, resources={})}
+    eng._submodules = {NODE: SubmoduleManagement(sub, None, None, None, {})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     eng._runner = StepRunner({})

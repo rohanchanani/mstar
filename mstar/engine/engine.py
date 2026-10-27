@@ -274,6 +274,23 @@ class ForwardPassInfoWrapper:
         return getattr(self.info, name)
 
 
+@dataclass(frozen=True)
+class PreparedInputRow:
+    """An interpreted row parked before execution, retaining its input holds.
+
+    Interpretation may consume a streamed chunk or stage model state.  A
+    scheduler retry therefore reuses the row rather than calling prepare again.
+    """
+    inputs: NodeInputs
+    tensors: NameToTensorList
+    metadata: InputMetadata
+    info: CurrentForwardPassInfo
+    final_stream: bool
+    partition_done: bool
+    physical_inputs: NodeInputs | None = None
+
+
+
 @dataclass
 class ExecutingBatch:
     node_name: str
@@ -320,6 +337,10 @@ class ExecutingBatch:
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
+    physical_inputs: dict[int, NodeInputs] = field(default_factory=dict)
+    prepared_rows: dict[int, PreparedInputRow] = field(default_factory=dict)
+    # Written by execution, returned to the scheduler before routing this step.
+    deferred_rows: dict[int, PreparedInputRow] = field(default_factory=dict)
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -442,6 +463,34 @@ class ExecutingBatch:
             rid: info for rid, info in self.per_request_info_wrapped.items()
             if rid not in rids
         }
+
+    def retain_rows(self, rids: set[int]) -> dict[int, PreparedInputRow]:
+        return {
+            rid: PreparedInputRow(
+                inputs=inputs,
+                physical_inputs=self.physical_inputs.get(rid),
+                tensors=self.per_request_input_tensors.get(rid, {}),
+                metadata=self.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
+                info=self.per_request_info[rid],
+                final_stream=rid in self.final_stream_rids,
+                partition_done=rid in self.stream_partition_done_rids,
+            )
+            for rid, inputs in zip(self.request_ids, self.inputs, strict=False)
+            if rid in rids
+        }
+
+
+    def defer_except(self, selected: tuple[int, ...]) -> None:
+        deferred = set(self.request_ids) - set(selected)
+        if not deferred:
+            return
+        self.deferred_rows = self.retain_rows(deferred)
+        self.inputs = [
+            inputs for rid, inputs in zip(self.request_ids, self.inputs, strict=False)
+            if rid not in deferred
+        ]
+        self.drop_rids(deferred)
+
 
     def register_admit_error(
         self, reason: AdmitFailedReason, failed_resource: str | None = None,
@@ -1100,6 +1149,9 @@ class Engine:
         node_inputs: list[NodeInputs] = []
         # hoisted out of the per-request loop: the same for every row
         prepare = submodule.prepare_inputs
+        program = mgmt.physical
+        preparation_factory = (getattr(program, "input_preparation", None)
+                               if mgmt.tensor_program is not None else None)
         resources = mgmt.resources
         wrapped = batch.per_request_info_wrapped
         tensors = batch.per_request_input_tensors
@@ -1116,7 +1168,8 @@ class Engine:
             batch.node_name, (),
         )
         loopback = self._loopback_rows(batch)
-        if not mixed and walk not in keyed_walks:
+        if (not mixed and walk not in keyed_walks and not batch.prepared_rows
+                and preparation_factory is None):
             uniform = submodule.uniform_row_inputs(
                 walk, has_loopback=loopback is not None and all(loopback),
             )
@@ -1126,16 +1179,27 @@ class Engine:
                 # batch, on the gpu thread before the launch)
                 node_inputs = [uniform] * len(batch.request_ids)
                 batch.register_prepare_batch(node_inputs)
-                batch.running_batched = submodule.can_batch(
-                    batch=batch, model_inputs=node_inputs
+                batch.running_batched = (
+                    mgmt.tensor_program.can_batch(batch, node_inputs)
+                    if mgmt.tensor_program is not None else
+                    _bound_execution(submodule) or submodule.can_batch(
+                        batch=batch, model_inputs=node_inputs
+                    )
                 )
                 return
         # a step of one walk probes (or not) for every row alike
         step_probes = not mixed and walk in keyed_walks
         for i, rid in enumerate(batch.request_ids):
+            if rid in batch.prepared_rows:
+                retained = batch.prepared_rows[rid]
+                node_inputs.append(retained.inputs)
+                if retained.physical_inputs is not None:
+                    batch.physical_inputs[rid] = retained.physical_inputs
+                continue
             row_walk = walk_of(rid) if mixed else walk
             probe_prefix = (row_walk in keyed_walks) if mixed else step_probes
             try:
+                preparation = None if preparation_factory is None else preparation_factory()
                 req_inputs = prepare(
                     graph_walk=row_walk,
                     fwd_info=wrapped[rid],
@@ -1147,12 +1211,15 @@ class Engine:
                     is_final_stream_chunk=rid in final_rids,
                     input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
                     has_loopback=loopback is not None and loopback[i],
+                    **({"preparation": preparation} if preparation is not None else {}),
                 )
                 if req_inputs is not None and probe_prefix:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
                 if req_inputs is not None and (probe_prefix or mixed):
                     # the submodule reads a mixed step's rows by their own walk
                     req_inputs.graph_walk = row_walk
+                if req_inputs is not None and preparation is not None:
+                    batch.physical_inputs[rid] = preparation.finish(req_inputs)
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
@@ -1167,8 +1234,12 @@ class Engine:
 
         batch.register_prepare_batch(node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
-        batch.running_batched = submodule.can_batch(
-            batch=batch, model_inputs=node_inputs
+        batch.running_batched = (
+            mgmt.tensor_program.can_batch(batch, node_inputs)
+            if mgmt.tensor_program is not None else
+            _bound_execution(submodule) or submodule.can_batch(
+                batch=batch, model_inputs=node_inputs
+            )
         )
 
     def _loopback_rows(self, batch: ExecutingBatch) -> list[bool] | None:
