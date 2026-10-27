@@ -17,7 +17,8 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.engine import Engine
+from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.resources.step import StepContext
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
@@ -151,27 +152,21 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
 
 
 def _exec_fake(runner, raise_with):
-    fake = SimpleNamespace(
-        _enable_nvtx=False, _enable_profile=False, _device=torch.device("cpu"),
-        _submodules={"dit": SimpleNamespace(submodule=object())},
-        _autocast_dtype_for=lambda submodule: None,
-        reserve_replay_slot=lambda batch: None,
-        _exec_single=_raiser(raise_with),
-        _exec_per_request=_raiser(raise_with),
-        _runner=runner,
-    )
-    fake.exec = Engine.exec.__get__(fake)
+    fake = Engine.__new__(Engine)
+    fake._enable_nvtx = fake._enable_profile = False
+    fake._device = torch.device("cpu")
+    fake._submodules = {"dit": SimpleNamespace(submodule=SimpleNamespace(execution_capabilities=None))}
+    fake._autocast_dtype_for = lambda submodule: None
+    fake.reserve_replay_slot = lambda batch: None
+    fake._exec_single = fake._exec_per_request = _raiser(raise_with)
+    fake._runner = runner
     return fake
 
 
-def _batch(preplanned) -> SimpleNamespace:
-    return SimpleNamespace(
-        request_ids=["a"], node_name="dit", running_batched=True,
-        step_context=SimpleNamespace(graph_walk="decode", slot_lease=None),
+def _batch(preplanned) -> ExecutingBatch:
+    return ExecutingBatch(
+        "dit", {}, StepContext(["a"], "decode", 0, False), running_batched=True,
         preplanned_rids=preplanned, preplan_event=object(),
-        outputs_ready=SimpleNamespace(set=lambda: None),
-        release_waiters=lambda: None,
-        exec_timings=SimpleNamespace(start=None),
     )
 
 
@@ -203,17 +198,15 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     # exec), then prepare_inputs dropped "b": the stale step must not reach
     # admit, so the reset clears it even though the batch still has inputs
     cleared = []
-    fake = SimpleNamespace(
-        _enable_nvtx=False,
-        _submodules={"dit": SimpleNamespace(accelerator_graph_runner=None)},
-        _runner=SimpleNamespace(clear_preplan=lambda: cleared.append(True)),
-    )
-    fake.reset_pre_plan_for_batch = Engine.reset_pre_plan_for_batch.__get__(fake)
-    fake.preplan_is_stale = Engine.preplan_is_stale.__get__(fake)
-    batch = SimpleNamespace(
-        request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
+    fake = Engine.__new__(Engine)
+    fake._enable_nvtx = False
+    fake._submodules = {"dit": SimpleNamespace(
+        accelerator_graph_runner=None, submodule=SimpleNamespace(execution_capabilities=None),
+    )}
+    fake._runner = SimpleNamespace(clear_preplan=lambda: cleared.append(True))
+    batch = ExecutingBatch(
+        "dit", {}, StepContext(["a"], "decode", 0, False), inputs=[object()], step=object(),
         preplanned_rids=("a", "b"), preplan_event=object(),
-        step_context=SimpleNamespace(slot_lease=None),
     )
     assert fake.preplan_is_stale(batch)
     fake.reset_pre_plan_for_batch(batch)

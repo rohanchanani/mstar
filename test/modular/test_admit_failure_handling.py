@@ -141,7 +141,7 @@ def _batches(reason, prepared=("r0", "r1"), cached=()):
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(
-        node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached),
+        node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached), prepared_rows={},
     )
     return batch, node_batch
 

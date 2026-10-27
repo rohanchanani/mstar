@@ -735,7 +735,7 @@ class _Rank:
 def _oom(rank, referenced_rids=frozenset()):
     batch = SimpleNamespace(
         node_name="node", graph_walk="walk",
-        request_to_worker_graph={"r0": "wg", "r1": "wg"},
+        request_to_worker_graph={"r0": "wg", "r1": "wg"}, prepared_rows={},
     )
     node_batch = SimpleNamespace(node_name="node", failed_resource=None, admit_error=None)
     rank._handle_allocation_failure(batch, node_batch, referenced_rids)
