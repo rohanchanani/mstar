@@ -15,6 +15,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence import SequenceBudget
 
 
 class KVLayout(Enum):
@@ -390,6 +391,8 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
+    # Deployment capacity is separate from model-owned logical geometry.
+    budget: "SequenceBudget | None" = None
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -403,9 +406,14 @@ class KVSpec(NodeResourceSpec):
         return KVManager
 
     def apply_yaml_overrides(self, **kwargs):
-        """Forwarded to the config: which keys are legal is a property of the
-        storage strategy, so the config answers for them."""
-        self.config.apply_yaml_overrides(**kwargs)
+        """Apply a logical storage budget or the physical config's tunables."""
+        if isinstance(self.config, SequenceKVConfig):
+            from mstar.engine.resources.sequence import SequenceBudget
+
+            if kwargs:
+                self.budget = SequenceBudget(**kwargs)
+        else:
+            self.config.apply_yaml_overrides(**kwargs)
 
 
 @dataclass(frozen=True)

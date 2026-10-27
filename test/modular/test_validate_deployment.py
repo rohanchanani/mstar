@@ -524,3 +524,67 @@ def test_worker_graph_problems_are_reported_together(tmp_path):
     assert problems[2] == (
         "Resource spec kv nodes ['llm', 'post'] must use the same TP x SP shape across replicas"
     )
+
+
+# Logical storage has a deployment budget before physical views are selected.
+def _logical_kv():
+    from mstar.engine.resources.kv.config import KVSpec, SequenceKVConfig
+
+    return KVSpec(resource_key="kv", nodes={"llm"}, config=SequenceKVConfig(
+        num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=128,
+    ))
+
+
+def test_logical_budget_has_one_parser_for_validation_and_worker_setup():
+    from copy import deepcopy
+    from mstar.engine.resources.sequence import SequenceBudget
+    from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.validation.resources import _apply_overrides
+
+    validated, worker = _logical_kv(), _logical_kv()
+    geometry = deepcopy(vars(validated.config))
+    values = {"max_bytes": 65536, "cpu_offload_bytes": 32768,
+              "prefix_cache": True, "prefix_cache_salt": "tenant"}
+    config = {"resources": {"kv": values}}
+    assert list(_apply_overrides([validated], config)) == []
+    apply_yaml_overrides([worker], config)
+    assert validated.budget == worker.budget == SequenceBudget(**values)
+    assert vars(validated.config) == vars(worker.config) == geometry
+
+
+@pytest.mark.parametrize("values", [
+    {"max_bytes": 0}, {"max_bytes": -1},
+    {"max_bytes": 65536, "cpu_offload_bytes": -1},
+    {"max_bytes": 65536, "page_size": 128}, {"prefix_cache": True},
+])
+def test_logical_budget_rejections_agree_at_both_entry_points(values):
+    from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.validation.resources import _apply_overrides
+
+    validated, worker = _logical_kv(), _logical_kv()
+    config = {"resources": {"kv": values}}
+    with pytest.raises((TypeError, ValueError)) as error:
+        apply_yaml_overrides([worker], config)
+    assert list(_apply_overrides([validated], config)) == [f"resources.kv: {error.value}"]
+    assert validated.budget is worker.budget is None
+
+
+@pytest.mark.parametrize("config", [{}, {"resources": {}}, {"resources": {"kv": {}}}])
+def test_absent_or_empty_logical_budget_does_not_replace_existing_budget(config):
+    from mstar.engine.resources.sequence import SequenceBudget
+    from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.validation.resources import _apply_overrides
+
+    for initial in (None, SequenceBudget(max_bytes=65536)):
+        spec = _logical_kv()
+        spec.budget = initial
+        assert list(_apply_overrides([spec], config)) == []
+        assert spec.budget is initial
+        apply_yaml_overrides([spec], config)
+        assert spec.budget is initial
+
+
+def test_logical_budget_is_accepted_by_full_deployment_validation(tmp_path):
+    spec = _logical_kv()
+    _validate(_Model(specs=[spec]), _cfg(tmp_path, resources={"kv": {"max_bytes": 65536}}))
+    assert spec.budget.max_bytes == 65536
