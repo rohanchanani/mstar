@@ -15,6 +15,7 @@ And one autouse fixture that clears the cached platform around every test.
 """
 import sys
 import types
+from importlib.machinery import ModuleSpec
 
 import pytest
 import torch
@@ -41,12 +42,22 @@ except (AttributeError, RuntimeError):
 
 if "triton" not in sys.modules:
     triton = types.ModuleType("triton")
+    triton.__spec__ = ModuleSpec("triton", loader=None, is_package=True)
     triton.language = types.ModuleType("triton.language")
+    triton.language.__spec__ = ModuleSpec("triton.language", loader=None)
+    triton.language.int64 = int
     triton.language.constexpr = int
     triton.jit = lambda *a, **k: (lambda f: f)
     triton.cdiv = lambda a, b: -(-a // b)
-    triton.Config = lambda *a, **k: a
-    triton.autotune = lambda *a, **k: (lambda f: f)
+    triton.Config = lambda kwargs, **options: types.SimpleNamespace(kwargs=kwargs, **options)
+
+    def _autotune_stub(*args, **kwargs):
+        def decorate(function):
+            function.configs = kwargs.get("configs", [])
+            return function
+        return decorate
+
+    triton.autotune = _autotune_stub
     triton.heuristics = lambda *a, **k: (lambda f: f)
     sys.modules["triton"] = triton
     sys.modules["triton.language"] = triton.language
