@@ -23,7 +23,7 @@ from mstar.engine.resources.base import (
     CGSlotKey,
     EngineResourceInfo,
 )
-from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig, ResolvedSequenceConfig
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     KVPlanOutputs,
@@ -51,7 +51,7 @@ class CrossAttentionManager(AttentionResource):
         # the context cache's own head counts; see AttentionManager.build
         kv_config = info.dependency(spec.config.kv_cache).config
         backend = resolve_attn_backend(spec.config.backend, info.device)
-        if info.joint_comm_group is not None:
+        if info.joint_comm_group is not None and not isinstance(kv_config, ResolvedSequenceConfig):
             kv_config.shard(info.joint_comm_group.world_size)
         if backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(

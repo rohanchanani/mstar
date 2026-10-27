@@ -25,6 +25,7 @@ class AttnBackend(Enum):
     # Multi-head Latent Attention over a ``KVLayout.MLA`` cache (FlashInfer's
     # ``BatchMLAPagedAttentionWrapper``); queries are the absorbed latent form
     FLASHINFER_MLA = "flashinfer_mla"
+    AITER = "aiter"
 
 
 @dataclass

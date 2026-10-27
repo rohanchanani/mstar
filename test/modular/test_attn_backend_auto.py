@@ -6,6 +6,7 @@ since the managers allocate nothing until their first plan.
 """
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,7 +34,8 @@ from mstar.engine.resources.attn.ragged.flashinfer import (
     FlashInferRaggedManager,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
-from mstar.engine.resources.kv.config import PagedKVConfig, RingKVConfig, RingKVLayerConfig
+from mstar.engine.resources.kv.config import PagedKVConfig, RingKVConfig, RingKVLayerConfig, SequenceKVConfig
+from mstar.engine.resources.sequence import HeadSharded, PagedSequenceView, Replicated, SequenceBudget, resolve_sequence_config
 
 CPU = torch.device("cpu")
 
@@ -157,7 +159,7 @@ def test_ragged_attention_builds_flashinfer(spec_class, manager_class, backend):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("auto", AttnBackend.AUTO), ("flashinfer", AttnBackend.FLASHINFER), ("dense", AttnBackend.DENSE)],
+    [("auto", AttnBackend.AUTO), ("flashinfer", AttnBackend.FLASHINFER), ("dense", AttnBackend.DENSE), ("aiter", AttnBackend.AITER)],
 )
 def test_yaml_names_an_attention_backend(value, expected):
     spec, cross = attention_spec(backend=AttnBackend.DENSE), cross_spec()
@@ -179,10 +181,33 @@ def test_yaml_names_a_ragged_backend(value, expected):
 
 
 def test_yaml_rejects_an_unknown_backend():
-    with pytest.raises(ValueError, match="'aiter' is not a valid AttnBackend"):
-        attention_spec().apply_yaml_overrides(backend="aiter")
-    with pytest.raises(ValueError, match="'aiter' is not a valid AttnBackend"):
-        cross_spec().apply_yaml_overrides(backend="aiter")
+    with pytest.raises(ValueError, match="'invalid_backend' is not a valid AttnBackend"):
+        attention_spec().apply_yaml_overrides(backend="invalid_backend")
+    with pytest.raises(ValueError, match="'invalid_backend' is not a valid AttnBackend"):
+        cross_spec().apply_yaml_overrides(backend="invalid_backend")
     ragged = RaggedAttentionSpec(resource_key="ragged", nodes={"node"}, config=ragged_config())
     with pytest.raises(ValueError, match="'aiter' is not a valid RaggedAttnBackend"):
         ragged.apply_yaml_overrides(backend="aiter")
+
+@pytest.mark.parametrize(("manager_class", "make_spec"), [
+    (AttentionManager, attention_spec), (CrossAttentionManager, cross_spec),
+])
+@pytest.mark.parametrize("partition", [Replicated(), HeadSharded(), None], ids=["replicated", "head_sharded", "legacy"])
+def test_attention_build_preserves_resolved_partition_and_shards_legacy(manager_class, make_spec, partition):
+    if partition is None:
+        config = paged_config()
+    else:
+        logical = KVSpec(resource_key="kv", nodes={"node"}, config=SequenceKVConfig(
+            num_layers=2, num_kv_heads=2, num_qo_heads=4, head_dim=64, max_seq_len=1024,
+        ), budget=SequenceBudget(1024 * 1024))
+        config = resolve_sequence_config(logical, (PagedSequenceView(16, partition),),
+                                         dtype=torch.bfloat16, group_size=2)
+        config.shard = lambda _: pytest.fail("attention repartitioned resolved geometry")
+    expected_heads = (2, 4) if isinstance(partition, Replicated) else (1, 2)
+    info = EngineResourceInfo(CPU, joint_comm_group=SimpleNamespace(world_size=2), dependencies={
+        "kv": KVSpec(resource_key="kv", nodes={"node"}, config=config),
+    })
+    manager = manager_class.build(make_spec(), info)
+    assert (config.num_kv_heads, config.num_qo_heads) == expected_heads
+    assert (manager._wrapper_kv_kwargs["num_kv_heads"],
+            manager._wrapper_kv_kwargs["num_qo_heads"]) == expected_heads
