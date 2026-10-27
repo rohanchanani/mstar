@@ -764,6 +764,23 @@ class Model(ABC):
         """
         return output.cpu().numpy().tobytes()
 
+    @classmethod
+    def describe(cls, **model_kwargs):
+        """Read logical declarations without constructing serving assets."""
+        raise NotImplementedError(f"{cls.__name__} has no read-only description path")
+
+    def create_submodule(self, node_name: str):
+        """Construct a fresh logical/lifecycle shell for implementation binding.
+
+        Models opt in by separating their reference program from the shell.
+        The existing loaded-submodule path remains available via get_submodule.
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no fresh node construction")
+
+    def logical_weights(self):
+        """Model-owned parameter identities and values, before physical packing."""
+        raise NotImplementedError(f"{type(self).__name__} has no logical weight source")
+
     @abstractmethod
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
@@ -818,6 +835,14 @@ class Model(ABC):
         None (the default) declares nothing, so nothing is reported.
         """
         return None
+
+    def quality_baselines(self) -> dict:
+        """Declarative task-quality baselines available to deployment authors.
+
+        Descriptions identify fixed evaluation data, metrics and baseline results.
+        They supply no execution or acceptance callbacks.
+        """
+        return {}
 
     def get_autocast_dtype(self):
         return torch.bfloat16

@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -18,12 +17,8 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
-from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.position.manager import PositionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.contract import NodeContract, TensorInput, TensorOutput
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -31,7 +26,6 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
-from mstar.model.whisper.components.decoder import WhisperDecoderModel
 from mstar.model.whisper.config import (
     ATTN,
     CONTEXT_LABEL,
@@ -42,9 +36,7 @@ from mstar.model.whisper.config import (
     SAMPLER,
     WhisperModelConfig,
 )
-
-logger = logging.getLogger(__name__)
-
+from mstar.model.whisper.results import DecoderResult, EncoderResult
 
 # ===================================================================
 # 1. WhisperEncoderSubmodule (stateless)
@@ -60,10 +52,34 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     for the decoder's cross-attention. Runs once per request.
     """
 
-    def __init__(self, audio_encoder: nn.Module, config: WhisperModelConfig):
+    def __init__(self, config: WhisperModelConfig, reference_program: nn.Module | None = None):
         super().__init__()
-        self.audio_encoder = audio_encoder
         self.config = config
+        self.reference_program = reference_program
+
+    def make_reference_program(self, binding):
+        from mstar.model.whisper.reference import build_encoder
+        return build_encoder(self.config, binding.model.logical_weights().load(),
+                             device=binding.device, dtype=binding.dtype)
+
+    def logical_contract(self) -> NodeContract:
+        return NodeContract(
+            inputs=(TensorInput("audio_features", "tensor_inputs.audio_features",
+                                (self.config.num_mel_bins, self.config.max_source_positions * 2)),),
+            outputs=(TensorOutput("encoder_states",
+                                  (self.config.max_source_positions, self.config.d_model),
+                                  per_request=True),),
+            result_type=EncoderResult,
+            weight_prefix="encoder.",
+        )
+
+    def execution_result(self, result, invocation):
+        from mstar.engine.execution import ExecutionResult
+        from mstar.model.submodule_base import BatchedModelOutput
+        return ExecutionResult(outputs=BatchedModelOutput(per_rid_outputs={
+            rid: {"encoder_states": [states]}
+            for rid, states in zip(invocation.request_ids, result.encoder_states, strict=True)
+        }, check_stop_buffers={}))
 
     def prepare_inputs(
         self,
@@ -83,13 +99,9 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         audio_features: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        device = self.get_device()
-        dtype = next(self.audio_encoder.parameters()).dtype
-        feats = audio_features.to(device=device, dtype=dtype)
-        if feats.dim() == 2:
-            feats = feats.unsqueeze(0)  # (1, num_mel_bins, 3000)
-        encoder_states = self.audio_encoder(feats).last_hidden_state.squeeze(0)
-        return {"encoder_states": [encoder_states]}
+        if self.reference_program is None:
+            raise RuntimeError("The fresh encoder must be bound to an execution program")
+        return {"encoder_states": [self.reference_program.run(audio_features=audio_features)]}
 
 
 # ===================================================================
@@ -110,53 +122,50 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
 
     Both cache streams belong to the step: ``main`` grows by the token
     count, ``context`` grows by the encoder output at prefill and is
-    declared zero-span (read-only) thereafter. Only decode is captured —
-    prefill runs once per request and is dominated by the 1500-token
-    cross-K/V projection, which has nothing to gain from a graph.
+    declared zero-span (read-only) thereafter.
     """
 
-    # Every prefill is the same shape (a 4-token forced prompt over a
-    # max_source_positions encoder window), so decode is the only walk whose
-    # capture buys anything.
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
-
-    def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig):
+    def __init__(self, config: WhisperModelConfig, reference_program: nn.Module | None = None):
         super().__init__()
-        self.decoder = decoder
         self.config = config
-        self._suppress_ids: torch.Tensor | None = None
-        self._begin_suppress_ids: torch.Tensor | None = None
+        self.reference_program = reference_program
 
-    def _apply_suppress(self, logits: torch.Tensor, is_first_token: bool) -> torch.Tensor:
-        """HF generate parity: mask the always-suppressed token set, plus
-        the begin-suppressed set for the first generated token."""
-        device = logits.device
-        if self._suppress_ids is None:
-            self._suppress_ids = torch.tensor(
-                self.config.suppress_tokens, dtype=torch.long, device=device,
-            )
-            self._begin_suppress_ids = torch.tensor(
-                self.config.begin_suppress_tokens, dtype=torch.long, device=device,
-            )
-        if self._suppress_ids.numel():
-            logits.index_fill_(-1, self._suppress_ids, float("-inf"))
-        if is_first_token and self._begin_suppress_ids.numel():
-            logits.index_fill_(-1, self._begin_suppress_ids, float("-inf"))
-        return logits
+    def make_reference_program(self, binding):
+        from mstar.model.whisper.reference import build_decoder
+        return build_decoder(self.config, binding.model.logical_weights().load(),
+                             device=binding.device, dtype=binding.dtype,
+                             tp_group=binding.tp_group)
 
-    def get_accelerator_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[AcceleratorGraphConfig]:
-        return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk="decode",
-                single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    input_seq_len=1,
-                ),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+    def logical_contract(self) -> NodeContract:
+        return NodeContract(
+            inputs=(
+                TensorInput("input_ids", "input_ids", ("tokens",), dtype=torch.long),
+                TensorInput("encoder_states", "tensor_inputs.encoder_states",
+                            (self.config.max_source_positions, self.config.d_model),
+                            walks=("prefill",)),
             ),
-        ]
+            outputs=(TensorOutput("tokens", ("batch",), dtype=torch.long),),
+            result_type=DecoderResult,
+            weight_prefix="decoder.",
+            suppressed_tokens={
+                SAMPLER: {
+                    walk: tuple(self.config.suppressed_tokens(walk))
+                    for walk in ("prefill", "decode")
+                },
+            },
+        )
+
+    def execution_result(self, result, invocation):
+        from mstar.engine.execution import ExecutionResult
+        from mstar.engine.resources.sampler.resource import SamplingResult
+        from mstar.model.submodule_base import BatchedModelOutput
+        return ExecutionResult(
+            outputs=BatchedModelOutput(
+                row_outputs={"new_token": result.tokens},
+                check_stop_buffers={"new_token": result.tokens},
+            ),
+            resource_results={SAMPLER: SamplingResult(result.tokens)},
+        )
 
     def prepare_inputs(
         self,
@@ -165,12 +174,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> ARNodeInputs:
-        device = self.get_device()
-        token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
+        token_ids = inputs["text_inputs"][0].reshape(-1)
 
         tensor_inputs = {}
         if graph_walk == "prefill":
-            tensor_inputs["encoder_states"] = inputs["encoder_states"][0].to(device)
+            tensor_inputs["encoder_states"] = inputs["encoder_states"][0]
 
         return ARNodeInputs(
             input_seq_len=token_ids.shape[0],
@@ -252,28 +260,10 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         encoder_states: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Run the decoder and sample one token per request."""
-        attn: AttentionManager = engine_inputs.resources[ATTN]
-        pos: PositionManager = engine_inputs.resources[POS]
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-
-        if encoder_states is not None:
-            # prefill only: fills the context pages this step reserved, before
-            # the layers read them back
-            self.decoder.write_cross_kv(encoder_states)
-
-        input_embeds = self.decoder.embed(input_ids, pos.pos_ids("main"))
-        hidden = self.decoder(input_embeds=input_embeds, label="main")
-
-        if graph_walk == "prefill":
-            # packed prefill: one hidden per request, at its last token
-            hidden = attn.select_last_hidden(hidden)
-
-        logits = self.decoder.lm_head(hidden)
-        logits = self._apply_suppress(
-            logits, is_first_token=graph_walk == "prefill",
-        )
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        """The explicit legacy reference path; bound programs bypass this body."""
+        if self.reference_program is None:
+            raise RuntimeError("The fresh decoder must be bound to an execution program")
+        return self.reference_program.run(graph_walk, engine_inputs, input_ids, encoder_states)
 
     def forward(
         self,
@@ -291,22 +281,6 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 encoder_states=encoder_states,
             )]
         }
-
-    # Prefill isn't captured, so the engine's capture cap doesn't bound it and
-    # `can_batch` would take the whole ready set. A set too big for the context
-    # cache can't be admitted; with offload configured it evicts and retries,
-    # without it there is nothing to evict and the batch reforms identically.
-    MAX_BATCH_SIZE = 16
-
-    def can_batch(
-        self, batch: ExecutingBatch,
-        model_inputs: list[NodeInputs],
-    ) -> bool:
-        return True
-
-    def max_batch_size(self, graph_walk: str) -> int | None:
-        del graph_walk
-        return self.MAX_BATCH_SIZE
 
     def forward_batched(
         self,
@@ -339,6 +313,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # Only decode's client edge is non-persisted; its local tensor loop
+        # still follows the ordinary route/refcount path.
+        return {"new_token": "new_token"} if graph_walk == "decode" else {}
 
     def check_stop(
         self,

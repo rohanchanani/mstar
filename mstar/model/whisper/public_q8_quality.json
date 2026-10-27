@@ -1,0 +1,65 @@
+{
+  "metric": "english_word_error_rate_v1",
+  "model": "openai/whisper-tiny",
+  "revision": "169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
+  "language": "en",
+  "task": "transcribe",
+  "temperature": 0.0,
+  "max_new_tokens": 444,
+  "baseline": {
+    "word_edits": 10,
+    "reference_words": 87,
+    "source_sha256": "b302260e14d4b7cdae9bccffcc9b42a1c100ac3a8bbabeb4837bc653e2024f8f"
+  },
+  "normalizer_revision": "86098128c0b4f24f0e2aa2994de830614b474227",
+  "samples": [
+    {
+      "id": "en_short_01",
+      "reference": "Television reports show white smoke coming from the plant.",
+      "normalized_reference": "television reports show white smoke coming from the plant",
+      "audio_sha256": "2ba00d1e53717ed882e7d09fe054ce537bc8ad436e134fb08f8d282f2c24cd96",
+      "path": "en_short_01.wav",
+      "bytes": 122924
+    },
+    {
+      "id": "en_short_03",
+      "reference": "Aerosmith have cancelled their remaining concerts on their tour.",
+      "normalized_reference": "aerosmith have canceled their remaining concerts on their tour",
+      "audio_sha256": "c69bb9bc19227fe0ffd3c7207ec3f6c4cabcaa3d3a6bc6cdc4cbd93438330dda",
+      "path": "en_short_03.wav",
+      "bytes": 126764
+    },
+    {
+      "id": "en_short_04",
+      "reference": "Thus, the pencil was a good friend to many people when it came out.",
+      "normalized_reference": "thus the pencil was a good friend to many people when it came out",
+      "audio_sha256": "cd3d9cf843170e0ceb9e697903cd34537d443e59487eaa2d0ad2b732cb9fc4ff",
+      "path": "en_short_04.wav",
+      "bytes": 126764
+    },
+    {
+      "id": "en_long_01",
+      "reference": "However, due to the slow communication channels, styles in the west could lag behind by 25 to 30 year.",
+      "normalized_reference": "however due to the slow communication channels styles in the west could lag behind by 25 to 30 year",
+      "audio_sha256": "f476130fb72205c66a27e6a121d0cef4c90d61126cc69f6fd72e67d546acc54a",
+      "path": "en_long_01.wav",
+      "bytes": 337964
+    },
+    {
+      "id": "en_long_03",
+      "reference": "The hospital has followed protocol for infection control, including separating the patient from others to prevent possible infection of others.",
+      "normalized_reference": "the hospital has followed protocol for infection control including separating the patient from others to prevent possible infection of others",
+      "audio_sha256": "e34547b128e6392df445ca51eaab75070c04fac6037da5e08142fb84f5eded4a",
+      "path": "en_long_03.wav",
+      "bytes": 365484
+    },
+    {
+      "id": "en_long_04",
+      "reference": "The Northern Marianas emergency management office said that there were no damages reported in the nation.",
+      "normalized_reference": "the northern marianas emergency management office said that there were no damages reported in the nation",
+      "audio_sha256": "f7a090433e6609f8d3445a7a1ddc2e9bf707c0992db5c34f86bb4f94dfacb5e3",
+      "path": "en_long_04.wav",
+      "bytes": 345644
+    }
+  ]
+}

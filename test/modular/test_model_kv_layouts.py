@@ -633,7 +633,7 @@ def _whisper():
 
     model = object.__new__(WhisperModel)
     model.config = WhisperModelConfig(lang_to_id={"<|en|>": 50259}, task_to_id={"transcribe": 50360})
-    model.feature_extractor = WhisperFeatureExtractor(feature_size=model.config.num_mel_bins)
+    model._feature_extractor = WhisperFeatureExtractor(feature_size=model.config.num_mel_bins)
     return model
 
 

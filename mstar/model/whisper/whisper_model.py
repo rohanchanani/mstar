@@ -24,6 +24,7 @@ engine's pre-planned cross-attention resource.
 
 import logging
 from pathlib import Path
+from time import perf_counter
 
 import torch
 
@@ -39,12 +40,12 @@ from mstar.engine.resources import (
     CrossAttentionSpec,
     KVSpec,
     NodeResourceSpec,
-    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    SequenceKVConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -64,63 +65,92 @@ from mstar.model.whisper.config import (
 logger = logging.getLogger(__name__)
 
 
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
+def _resolve_local_hf_snapshot(
+    repo_id: str, cache_dir: str | None = None, *, local_files_only: bool = False,
+) -> str:
+    if Path(repo_id).is_dir():
+        return str(Path(repo_id).resolve())
+    if local_files_only:
+        raise FileNotFoundError(f"model description requires a local configuration directory: {repo_id}")
+
     from huggingface_hub import snapshot_download
 
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-        )
-    except Exception as e:
-        logger.warning("Error downloading from HuggingFace: %s", str(e))
-        return repo_id
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        cache_dir=cache_dir,
+        local_files_only=False,
+    )
     return str(Path(local_dir))
 
 
 class WhisperModel(Model):
     """Whisper ASR: HF audio encoder + mstar-native AR decoder."""
 
-    # Requests the default decoder caches hold at once, each at full length.
-    # A deployment retunes the page counts under ``resources:`` in its YAML.
-    MAX_CONCURRENT_REQUESTS = 64
-
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        local_files_only: bool = False,
         **kwargs,
     ):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
-
-        self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
+        self.local_dir = _resolve_local_hf_snapshot(
+            model_path_hf, cache_dir=cache_dir, local_files_only=local_files_only,
+        )
         self.config = WhisperModelConfig.from_pretrained(self.local_dir)
-
-        from transformers import AutoFeatureExtractor, AutoTokenizer
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.local_dir, cache_dir=cache_dir,
-        )
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(
-            self.local_dir, cache_dir=cache_dir,
-        )
-
-        from mstar.model.utils import ByteLevelDetokenizer
-        self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-
+        self._tokenizer = None
+        self._feature_extractor = None
+        self._detokenizer_cache = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+
+    @classmethod
+    def describe(cls, **model_kwargs):
+        """Read configuration and expose the ordinary model declarations."""
+        return cls(**(model_kwargs | {"local_files_only": True}))
+
+    def warmup_preprocess(self) -> None:
+        """Load the cached prompt and text-output assets in their owning thread."""
+        logger.info("Whisper preprocessing asset warmup started")
+        started = perf_counter()
+        _ = self.feature_extractor
+        features_ready = perf_counter()
+        _ = self._detokenizer
+        ready = perf_counter()
+        logger.info(
+            "Whisper preprocessing assets ready: feature_extractor_seconds=%.6f "
+            "detokenizer_seconds=%.6f total_seconds=%.6f",
+            features_ready - started, ready - features_ready, ready - started,
+        )
+
+    @property
+    def tokenizer(self):
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.local_dir, cache_dir=self.cache_dir, local_files_only=True,
+            )
+        return self._tokenizer
+
+    @property
+    def feature_extractor(self):
+        if self._feature_extractor is None:
+            from mstar.model.whisper.feature_extraction import WhisperFeatureExtractor
+            self._feature_extractor = WhisperFeatureExtractor.from_pretrained(
+                self.local_dir, cache_dir=self.cache_dir, local_files_only=True,
+            )
+        return self._feature_extractor
+
+    @property
+    def _detokenizer(self):
+        if self._detokenizer_cache is None:
+            from mstar.model.utils import ByteLevelDetokenizer
+            self._detokenizer_cache = ByteLevelDetokenizer(self.tokenizer)
+        return self._detokenizer_cache
 
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
-
-    @staticmethod
-    def _cache_pages(tokens: int, page_size: int, requests: int) -> int:
-        """Pages for ``requests`` sequences of ``tokens`` each, plus the sink
-        page every KV cache keeps out of circulation."""
-        return 1 + requests * -(-tokens // page_size)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Decoder self-attention KV + a separate encoder-context KV.
@@ -130,34 +160,19 @@ class WhisperModel(Model):
         would have it planning the 1500-token context every step for nothing.
         ``audio_encoder`` is stateless.
         """
-        page_size = 128
-        requests = self.MAX_CONCURRENT_REQUESTS
-        # Sequences cap at max_target_positions (448) = 4 pages per request;
-        # 257 pages at ~5 GiB for large-v3 (vs 40 GiB with the 2048-page default).
-        kv_config = PagedKVConfig(
+        kv_config = SequenceKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_target_positions,
             num_qo_heads=self.config.decoder_attention_heads,
-            page_size=page_size,
-            max_num_pages=self._cache_pages(
-                self.config.max_target_positions, page_size, requests,
-            ),
         )
-        # The fixed 30 s window is max_source_positions (1500) tokens = 12
-        # pages per request, held from prefill to the last token; 769 pages at
-        # ~15 GiB for large-v3.
-        context_kv_config = PagedKVConfig(
+        context_kv_config = SequenceKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_source_positions,
             num_qo_heads=self.config.decoder_attention_heads,
-            page_size=page_size,
-            max_num_pages=self._cache_pages(
-                self.config.max_source_positions, page_size, requests,
-            ),
         )
         return [
             KVSpec(resource_key=KV_CACHE, nodes={"decoder"}, config=kv_config),
@@ -205,46 +220,6 @@ class WhisperModel(Model):
                 ignore_eos=model_kwargs.get("ignore_eos", False),
             )
         }
-
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a request cap the decoder caches cannot hold.
-
-        A request keeps its encoder context from prefill to its last token, so
-        nothing frees cross-attention pages but a finished request. Past the
-        pool a prefill batch is refused and the worker offloads decoding
-        requests to admit it, which costs far more than queueing would. So
-        ``max_concurrent_requests`` requests at full length must fit in each
-        cache next to its sink page; the conductor queues the rest.
-        """
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: past the requests the decoder "
-                "caches hold, the worker offloads decoding requests to admit new "
-                "ones instead of queueing them", config_path,
-            )
-            return
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-            raise ValueError(
-                f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}"
-            )
-        overrides = config.get("resources") or {}
-        for spec in self.get_node_resources():
-            if not isinstance(spec, KVSpec):
-                continue
-            kv = spec.config
-            override = overrides.get(spec.resource_key) or {}
-            page_size = int(override.get("page_size", kv.page_size))
-            max_num_pages = int(override.get("max_num_pages", kv.max_num_pages))
-            need = self._cache_pages(kv.max_seq_len, page_size, cap)
-            if need > max_num_pages:
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
-                    f"need {need} pages of resources.{spec.resource_key} "
-                    f"({-(-kv.max_seq_len // page_size)} per request and the sink page), "
-                    f"which has {max_num_pages}; raise max_num_pages or lower "
-                    "max_concurrent_requests"
-                )
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
@@ -376,6 +351,7 @@ class WhisperModel(Model):
     def max_input_files(self) -> dict[str, int]:
         return {"audio": 1}
 
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -427,8 +403,10 @@ class WhisperModel(Model):
             "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
         }, {"kv_layout": kv_layout})
 
+
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {
@@ -462,6 +440,29 @@ class WhisperModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
+
+    @classmethod
+    def node_types(cls):
+        from mstar.model.whisper.submodules import WhisperDecoderSubmodule, WhisperEncoderSubmodule
+        return {"audio_encoder": WhisperEncoderSubmodule, "decoder": WhisperDecoderSubmodule}
+
+    def create_submodule(self, node_name: str) -> NodeSubmodule | None:
+        """Fresh semantic/lifecycle shell, with no reference weights or compute."""
+        node_type = self.node_types().get(node_name)
+        return None if node_type is None else node_type(self.config)
+
+    def logical_weights(self):
+        from mstar.model.whisper.weights import logical_weights
+        if not hasattr(self, "_logical_weight_source"):
+            self._logical_weight_source = logical_weights(self.local_dir, self.config)
+        return self._logical_weight_source
+
+    def quality_baselines(self) -> dict:
+        import json
+        from pathlib import Path
+        descriptor = Path(__file__).with_name("public_q8_quality.json")
+        return {"public-q8-kleidiai-v1": json.loads(descriptor.read_text())}
+
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -507,8 +508,9 @@ class WhisperModel(Model):
         )
         audio_encoder.eval()
 
+        from mstar.model.whisper.reference import EncoderReference
         from mstar.model.whisper.submodules import WhisperEncoderSubmodule
-        return WhisperEncoderSubmodule(audio_encoder=audio_encoder, config=self.config)
+        return WhisperEncoderSubmodule(config=self.config, reference_program=EncoderReference(audio_encoder))
 
     @staticmethod
     def _decoder_remap(name: str) -> str:
@@ -544,5 +546,7 @@ class WhisperModel(Model):
         decoder.zero_missing_biases()
         decoder.eval()
 
-        from mstar.model.whisper.submodules import WhisperDecoderSubmodule
-        return WhisperDecoderSubmodule(decoder=decoder, config=self.config)
+        from mstar.model.whisper.reference import DecoderReference, WhisperDecoderReferenceSubmodule
+        return WhisperDecoderReferenceSubmodule(
+            config=self.config, reference_program=DecoderReference(decoder, self.config),
+        )

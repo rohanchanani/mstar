@@ -1195,6 +1195,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
     "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
+    "whisper": WhisperAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "omnilingual_asr_ctc_300m": OmnilingualASRAdapter(),
     "omnilingual_asr_ctc_1b": OmnilingualASRAdapter(),

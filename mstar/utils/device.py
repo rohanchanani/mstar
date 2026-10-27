@@ -46,6 +46,10 @@ class DeviceCapability:
     def pin_memory(self) -> bool:
         return self.is_available
 
+    @property
+    def timing_events(self) -> bool:
+        return self.is_accelerator and getattr(self._runtime, "supports_timing_events", True)
+
     def is_capturing(self) -> bool:
         return (
             self.graph_backend is not None

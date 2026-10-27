@@ -36,6 +36,8 @@ class WhisperModelConfig:
     decoder_attention_heads: int = 20
     decoder_ffn_dim: int = 5120
     encoder_layers: int = 32
+    encoder_attention_heads: int = 20
+    encoder_ffn_dim: int = 5120
     num_mel_bins: int = 128
     vocab_size: int = 51866
     max_target_positions: int = 448
@@ -109,3 +111,6 @@ class WhisperModelConfig:
             self.task_to_id[task],
             self.no_timestamps_token_id,
         ]
+
+    def suppressed_tokens(self, graph_walk: str) -> list[int]:
+        return self.suppress_tokens + (self.begin_suppress_tokens if graph_walk == "prefill" else [])

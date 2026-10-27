@@ -4,15 +4,14 @@ A request keeps its 1500-token encoder context (12 cross-attention pages) from
 prefill to its last token. When more requests are in flight than the cache
 holds, a prefill batch is refused and the worker offloads decoding requests to
 admit it, over and over. The shipped configs cap ``max_concurrent_requests``
-at what both caches hold, ``validate_config_yaml`` checks the two agree, and
-the conductor queues the rest. These tests drive the real conductor gate and
+at what both explicitly sized caches hold, and the conductor queues the rest.
+These tests drive the real conductor gate and
 the real page allocator on the CPU; no weights are loaded.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,12 +24,15 @@ import yaml
 
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import AllocationFailed, apply_yaml_overrides
+from mstar.engine.resources.binding import resolve_bound_specs
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.sequence import HeadSharded, PagedSequenceView
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.model.binding import resolve_autocast_dtype
 from mstar.model.whisper.config import CONTEXT_LABEL, CROSS_KV_CACHE, KV_CACHE, WhisperModelConfig
-from mstar.model.whisper.submodules import WhisperDecoderSubmodule
+from mstar.model.whisper.reference import WhisperDecoderReferenceSubmodule
 from mstar.model.whisper.whisper_model import WhisperModel
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
@@ -71,8 +73,23 @@ def _make_model() -> WhisperModel:
     return model
 
 
-def _kv_specs(model: WhisperModel) -> dict[str, KVSpec]:
-    return {s.resource_key: s for s in model.get_node_resources() if isinstance(s, KVSpec)}
+def _kv_specs(model: WhisperModel, config=None, *, requests=None) -> dict[str, KVSpec]:
+    config = config or yaml.safe_load((CONFIGS / "whisper_large.yaml").read_text())
+    specs = model.get_node_resources()
+    apply_yaml_overrides(specs, config)
+    decoder_group = next(group for group in config["node_groups"] if "decoder" in group["node_names"])
+    group_size = decoder_group.get("tp_size", 1) * decoder_group.get("sp_size", 1)
+    # The retained reference contributes this physical view at Engine binding.
+    physical_requests = {s.resource_key: (PagedSequenceView(partition=HeadSharded()),)
+                         for s in specs if isinstance(s, KVSpec)}
+    physical_requests.update(requests or {})
+    resolved = resolve_bound_specs(specs, physical_requests, dtype=resolve_autocast_dtype(model, config),
+                                   group_sizes=dict.fromkeys(physical_requests, group_size))
+    return {s.resource_key: s for s in resolved if isinstance(s, KVSpec)}
+
+
+def _request_cap() -> int:
+    return yaml.safe_load((CONFIGS / "whisper_large.yaml").read_text())["max_concurrent_requests"]
 
 
 def _manager(config: PagedKVConfig, name: str) -> KVManager:
@@ -120,7 +137,7 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     specs = _kv_specs(model)
     cross = _manager(specs[CROSS_KV_CACHE].config, CROSS_KV_CACHE)
     self_kv = _manager(specs[KV_CACHE].config, KV_CACHE)
-    batch_size = WhisperDecoderSubmodule.MAX_BATCH_SIZE
+    batch_size = WhisperDecoderReferenceSubmodule.MAX_BATCH_SIZE
     for i in range(arrivals):
         conductor._ingest_request(SimpleNamespace(
             request_id=f"r{i}", model_kwargs={}, client_request_id=None))
@@ -160,65 +177,64 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
 def test_default_caches_hold_the_request_cap():
     model = _make_model()
     specs = _kv_specs(model)
-    cap = WhisperModel.MAX_CONCURRENT_REQUESTS
+    cap = _request_cap()
     # 1500 encoder tokens and 448 decoder tokens in 128-token pages, plus the sink
     assert specs[CROSS_KV_CACHE].config.max_num_pages == 1 + 12 * cap
     assert specs[KV_CACHE].config.max_num_pages == 1 + 4 * cap
 
 
-@pytest.mark.parametrize("name", ["whisper_large", "whisper_large_tp2"])
-def test_shipped_yaml_caps_requests_at_what_the_caches_hold(name):
+@pytest.mark.parametrize(("name", "group_size", "offload_pages"), [
+    ("whisper_large", 1, 128), ("whisper_large_tp2", 2, 4096),
+])
+def test_shipped_yaml_caps_requests_at_what_the_caches_hold(name, group_size, offload_pages):
     path = CONFIGS / f"{name}.yaml"
     cfg = yaml.safe_load(path.read_text())
     model = _make_model()
-    assert cfg["max_concurrent_requests"] == WhisperModel.MAX_CONCURRENT_REQUESTS
-    model.validate_config_yaml(cfg, str(path))
-    # the YAML tunes host offload only; the pools validated are the pools built
-    specs = model.get_node_resources()
-    apply_yaml_overrides(specs, cfg)
-    pages = {s.resource_key: s.config.max_num_pages for s in specs if isinstance(s, KVSpec)}
+    assert cfg["max_concurrent_requests"] == _request_cap()
+    # Deployment supplies byte budgets; shared binding derives local storage.
+    specs = _kv_specs(model, cfg)
+    pages = {key: s.config.max_num_pages for key, s in specs.items()}
     assert pages == {
         key: s.config.max_num_pages for key, s in _kv_specs(model).items()
     }
+    assert resolve_autocast_dtype(model, cfg) == torch.bfloat16
+    for spec in specs.values():
+        assert spec.config.partition == "head_sharded"
+        assert spec.config.num_kv_heads == model.config.decoder_attention_heads // group_size
+        assert spec.config.cpu_offload_pages == offload_pages
+        assert spec.config.prefix_cache
 
 
-def test_a_cap_past_either_cache_is_refused():
+def test_cache_budget_and_admission_cap_are_independent_deployment_choices():
     model = _make_model()
-    cap = WhisperModel.MAX_CONCURRENT_REQUESTS
-    with pytest.raises(ValueError, match=f"resources.{KV_CACHE} "):
-        model.validate_config_yaml({"max_concurrent_requests": cap + 1}, "x.yaml")
-    roomy_self_kv = {"resources": {KV_CACHE: {"max_num_pages": 4096}}}
-    with pytest.raises(ValueError, match=CROSS_KV_CACHE):
-        model.validate_config_yaml({"max_concurrent_requests": cap + 1, **roomy_self_kv}, "x.yaml")
-    # the old 192-page context cache: 16 requests need 16 x 12 pages and the sink
-    old = {"resources": {CROSS_KV_CACHE: {"max_num_pages": 192}}}
-    with pytest.raises(ValueError, match="need 193 pages"):
-        model.validate_config_yaml({"max_concurrent_requests": 16, **old}, "x.yaml")
-    model.validate_config_yaml({"max_concurrent_requests": 15, **old}, "x.yaml")
-    # smaller pages: more of them per request
-    with pytest.raises(ValueError, match=f"resources.{KV_CACHE} "):
-        model.validate_config_yaml(
-            {"max_concurrent_requests": cap, "resources": {KV_CACHE: {"page_size": 64}}}, "x.yaml",
-        )
+    cfg = yaml.safe_load((CONFIGS / "whisper_large.yaml").read_text())
+    reference = _kv_specs(model, cfg)
+    page_bytes = {key: s.budget.max_bytes // s.config.max_num_pages for key, s in reference.items()}
+    cfg["max_concurrent_requests"] = 128
+    cfg["resources"][KV_CACHE]["max_bytes"] = 64 * page_bytes[KV_CACHE] // 2
+    cfg["resources"][CROSS_KV_CACHE]["max_bytes"] = 192 * page_bytes[CROSS_KV_CACHE]
+    specs = _kv_specs(model, cfg, requests={KV_CACHE: (PagedSequenceView(64, HeadSharded()),)})
+    physical = {key: s.config for key, s in specs.items()}
+    assert physical[KV_CACHE].page_size == 64
+    assert physical[KV_CACHE].max_num_pages == 64
+    assert physical[CROSS_KV_CACHE].max_num_pages == 192
 
 
 @pytest.mark.parametrize("cap", [0, -1, True, "64", 8.0])
-def test_a_cap_that_is_not_a_positive_int_is_refused(cap):
+def test_a_cap_that_is_not_a_positive_int_is_refused(cap, tmp_path):
+    path = tmp_path / "bad-cap.yaml"
+    config = yaml.safe_load((CONFIGS / "whisper_large.yaml").read_text())
+    config.update(device_type="cpu", max_concurrent_requests=cap)
+    path.write_text(yaml.safe_dump(config))
     with pytest.raises(ValueError, match="positive int"):
-        _make_model().validate_config_yaml({"max_concurrent_requests": cap}, "x.yaml")
-
-
-def test_no_cap_starts_with_a_warning(caplog):
-    with caplog.at_level(logging.WARNING, logger="mstar.model.whisper.whisper_model"):
-        _make_model().validate_config_yaml({}, "x.yaml")
-    assert "sets no max_concurrent_requests" in caplog.text
+        Conductor(_make_model(), str(path))
 
 
 def test_capped_arrivals_queue_instead_of_refusing_a_prefill():
     """Three times the cap arrive at once: the conductor holds the excess, and
     no prefill batch of the admitted ones is ever short of pages."""
     model = _make_model()
-    cap = WhisperModel.MAX_CONCURRENT_REQUESTS
+    cap = _request_cap()
     refused, peak = _serve(model, _conductor(cap), arrivals=3 * cap)
     assert refused == 0
     assert peak == cap
@@ -228,9 +244,9 @@ def test_uncapped_arrivals_refuse_prefills_once_the_cache_is_full():
     """The same arrivals with no cap: everything is dispatched, and the batches
     past the cache are refused, which is what sends the worker evicting."""
     model = _make_model()
-    refused, peak = _serve(model, _conductor(None), arrivals=3 * WhisperModel.MAX_CONCURRENT_REQUESTS)
+    refused, peak = _serve(model, _conductor(None), arrivals=3 * _request_cap())
     assert refused > 0
-    assert peak == 3 * WhisperModel.MAX_CONCURRENT_REQUESTS
+    assert peak == 3 * _request_cap()
 
 
 def test_old_context_cache_refused_a_full_prefill_batch_even_empty():
@@ -239,7 +255,7 @@ def test_old_context_cache_refused_a_full_prefill_batch_even_empty():
     model = _make_model()
     config = dataclasses.replace(_kv_specs(model)[CROSS_KV_CACHE].config, max_num_pages=192)
     cross = _manager(config, CROSS_KV_CACHE)
-    batch = [f"r{i}" for i in range(WhisperDecoderSubmodule.MAX_BATCH_SIZE)]
+    batch = [f"r{i}" for i in range(WhisperDecoderReferenceSubmodule.MAX_BATCH_SIZE)]
     for rid in batch:
         cross.ingest_request(rid)
     span = model.config.max_source_positions

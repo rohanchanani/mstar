@@ -1,14 +1,19 @@
 model: "whisper_large"
+autocast_dtype: bfloat16
 max_seq_len: 448
-# The decoder caches hold 64 requests at once (12 cross-attention and 4
-# self-attention pages each; checked at startup). Capped, further requests
-# queue; uncapped, the worker would offload decoding requests to admit them.
+# Per-rank BF16 payload budgets preserve 64 full-length requests with the
+# retained reference's head-sharded paged storage at TP2, including sink blocks.
+# The independent admission cap queues further requests before cache pressure.
 max_concurrent_requests: 64
 resources:
   kv_cache:
-    cpu_offload_pages: 4096
+    max_bytes: 2694840320
+    cpu_offload_bytes: 42949672960
+    prefix_cache: true
   cross_kv_cache:
-    cpu_offload_pages: 4096
+    max_bytes: 8063549440
+    cpu_offload_bytes: 42949672960
+    prefix_cache: true
 node_groups:
   - node_names: [audio_encoder]
     ranks: [0]

@@ -499,6 +499,9 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
+        cap = self.max_concurrent_requests
+        if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
+            raise ValueError("max_concurrent_requests must be a positive int")
         # Optional ``rank_devices: {rank: device_index}`` places a worker rank
         # on a device other than the one its number implies, e.g. two workers
         # sharing one GPU so a light node's steps stop interleaving with a
