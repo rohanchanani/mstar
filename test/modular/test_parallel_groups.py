@@ -231,7 +231,7 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     expected_group_calls = []
     for ranks in ((0, 1), (2, 3)):
         expected_group_calls.append((ranks, {}))
-        if device_type != "xpu":
+        if device_type not in ("cpu", "xpu"):
             expected_group_calls.append((
                 ranks, {"backend": "gloo", "use_local_synchronization": True},
             ))
@@ -239,7 +239,7 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
         {
             "backend": expected_backend, "store": store, "timeout": timeout,
             "world_size": 4, "rank": 0,
-            "device_id": device,
+            **({} if device_type == "cpu" else {"device_id": device}),
         },
         *expected_group_calls,
     ]
@@ -247,7 +247,7 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     for group in (tp, sp):
         assert group.initialized
         assert group.device_group is handles[((0, 1), None)]
-        if device_type == "xpu":
+        if device_type in ("cpu", "xpu"):
             assert group.cpu_group is group.device_group
         else:
             assert group.cpu_group is handles[((0, 1), "gloo")]

@@ -74,8 +74,9 @@ def test_init_dist_threads_timeout_into_world_and_every_subgroup(monkeypatch):
     assert calls["store"] == [expected]
     assert [c["timeout"] for c in calls["init"]] == [expected]
     # ``new_group`` runs once per rank tuple on every rank, members or not,
-    # for the device group and its gloo twin.
-    assert [c["timeout"] for c in calls["new_group"]] == [expected] * 4
+    # CPU device/control collectives share the same gloo group.
+    assert [c["timeout"] for c in calls["new_group"]] == [expected] * 2
+    assert "device_id" not in calls["init"][0]
 
 
 def test_init_dist_without_timeout_leaves_torch_default(monkeypatch):

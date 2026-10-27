@@ -1,3 +1,4 @@
+import logging
 import socket
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -131,6 +132,16 @@ class CommGroup:
         if self.world_size == 1:
             return input_
         return self._all_reduce.all_reduce(input_)
+
+    def all_gather_object(self, value):
+        """Small control metadata on the group's existing CPU transport."""
+        if self.world_size == 1:
+            return [value]
+        if not self.initialized or self.cpu_group is None:
+            raise RuntimeError("parallel control group has not been initialized")
+        values = [None] * self.world_size
+        dist.all_gather_object(values, value, group=self.cpu_group)
+        return values
 
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
@@ -278,6 +289,10 @@ class JointGroups:
         """Total ranks in ``node``'s lockstep instance (tp_size * sp_size)."""
         return  self.tp_group.world_size * self.sp_group.world_size
 
+    def all_gather_object(self, value):
+        rows = self.sp_group.all_gather_object(self.tp_group.all_gather_object(value))
+        return [value for row in rows for value in row]
+
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast from joint rank ``src`` to the whole TP x SP block.
 
@@ -336,6 +351,8 @@ class WorkerParallelGroups:
         str, frozenset[tuple[int, ...]]
     ] = field(default_factory=dict)
     _device: torch.device | None = field(default=None, init=False, repr=False)
+    _failed: bool = field(default=False, init=False, repr=False)
+    _owns_world: bool = field(default=False, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
     # Process-group timeout in seconds for load and warmup, from the config's
@@ -388,23 +405,25 @@ class WorkerParallelGroups:
         self._device = device
         if device.type != "cpu":
             torch.accelerator.set_device_index(device)
-        backend = dist.get_default_backend_for_device(device.type)
         if not self.any_parallelism:
             return
+        backend = dist.get_default_backend_for_device(device.type)
         if device.type == "xpu":
             backend = f"cpu:gloo,xpu:{backend}"
 
         timeout_kwargs = resolve_dist_timeout(self.dist_timeout_s)
         # a configured dist_timeout_s covers the rendezvous store too
         timeout = timeout_kwargs.get("timeout", default_group_timeout(backend))
+        device_args = {} if device.type == "cpu" else {"device_id": device}
         dist.init_process_group(
             backend=backend,
             store=rendezvous_store(init_method, self.global_rank, self.num_workers, timeout),
             world_size=self.num_workers,
             rank=self.global_rank,
-            device_id=device,
             timeout=timeout,
+            **device_args,
         )
+        self._owns_world = True
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
         # ``world_parallel_groups`` is the sorted union, so every rank
@@ -417,7 +436,7 @@ class WorkerParallelGroups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(
                 ranks=list(rank_tuple), **timeout_kwargs
             )
-            if device.type == "xpu":
+            if device.type in ("cpu", "xpu"):
                 rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
             else:
                 # Members only: with the default group bound to a device, a
@@ -445,6 +464,24 @@ class WorkerParallelGroups:
             # groups in the same relative order: GlobalParallelConfig fills
             # every worker's dicts in one global iteration order.
             comm_group.init_all_reduce(self.tp_allreduce, self.tp_allreduce_max_kb)
+
+    def mark_failed(self) -> None:
+        """A failed collective domain is retired by process exit, not a barrier."""
+        self._failed = True
+
+    def close(self) -> None:
+        """Tear down settled groups once submitters have stopped."""
+        if not self._owns_world:
+            return
+        if not self._failed and dist.is_initialized():
+            dist.destroy_process_group()
+        self._owns_world = False
+        for group in (*self.node_to_tp_group.values(), *self.node_to_sp_group.values()):
+            group.device_group = group.cpu_group = None
+            group.initialized = False
+        logging.getLogger(__name__).info(
+            "Process groups closed: rank=%d failed=%s", self.global_rank, self._failed,
+        )
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:
         if node not in self.node_to_tp_group:
