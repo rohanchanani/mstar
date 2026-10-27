@@ -41,7 +41,7 @@ from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
-from mstar.runtime_extensions import BackendFatalError
+from mstar.runtime_extensions import BackendFatalError, load_runtime_extension, run_managed_worker
 from mstar.utils import knobs
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
@@ -249,6 +249,7 @@ def _worker_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    runtime_owner=None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
     picklability. ``status_interval_s`` turns on the worker's metrics."""
@@ -272,6 +273,36 @@ def _worker_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    worker_kwargs = dict(
+        worker_id=worker_id,
+        worker_ids=worker_ids,
+        model=model,
+        my_worker_graphs=my_worker_graphs,
+        model_config=model_config,
+        all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
+        all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
+        all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+        sharding_config=sharding_config,
+        parallel_groups=parallel_groups,
+        hostname=hostname,
+        socket_path_prefix=socket_path_prefix,
+        dist_init_method=dist_init_method,
+        enable_nvtx=enable_nvtx,
+        enable_prof=enable_prof,
+        device=torch.device(device),
+        tensor_comm_protocol=tensor_comm_protocol,
+        tcp_transfer_device=tcp_transfer_device,
+        status_interval_s=status_interval_s,
+    )
+    extension = load_runtime_extension(model_config)
+    if extension is not None:
+        from mstar.worker.worker import Worker
+
+        return run_managed_worker(
+            Worker, worker_kwargs, extension, runtime_owner,
+            cleanup_worker=lambda worker: _unlink_owned_files(worker.tensor_manager)
+            if hasattr(worker, "tensor_manager") else None,
+        )
     built: list = []  # the Worker, once it exists
     threading.Thread(
         target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
@@ -279,31 +310,12 @@ def _worker_process_target(
     ).start()
 
     from mstar.worker.worker import Worker
+
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
         [set(wg.section.get_nodes()) for wg in my_worker_graphs]
     ))
     try:
-        worker = Worker(
-            worker_id=worker_id,
-            worker_ids=worker_ids,
-            model=model,
-            my_worker_graphs=my_worker_graphs,
-            model_config=model_config,
-            all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
-            all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
-            all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
-            sharding_config=sharding_config,
-            parallel_groups=parallel_groups,
-            hostname=hostname,
-            socket_path_prefix=socket_path_prefix,
-            dist_init_method=dist_init_method,
-            enable_nvtx=enable_nvtx,
-            enable_prof=enable_prof,
-            device=torch.device(device),
-            tensor_comm_protocol=tensor_comm_protocol,
-            tcp_transfer_device=tcp_transfer_device,
-            status_interval_s=status_interval_s,
-        )
+        worker = Worker(**worker_kwargs)
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
     except BaseException as e:
@@ -426,6 +438,7 @@ class Conductor:
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device="",
         status_interval_s: float | None = None,
+        runtime_admission=None,
     ):
         self.requests: dict[str, RequestData] = {}
         # Requests in teardown: kept in self.requests (so they still count toward
@@ -473,8 +486,14 @@ class Conductor:
         # Every check that needs only the model, this YAML and the environment,
         # before any worker exists; raises listing every problem found.
         deployment = validate_deployment(model, self.model_config, model_config_file)
+        self.runtime_extension = load_runtime_extension(self.model_config)
+        self.runtime_admission = runtime_admission
+        self._runtime_owners = {}
+        if self.runtime_extension is not None and self.runtime_admission is None:
+            self.runtime_admission = self.runtime_extension.admission_context()
         accelerator = torch.accelerator.current_accelerator(check_available=True)
-        self.device_type = accelerator.type if accelerator is not None else "cpu"
+        detected = accelerator.type if accelerator is not None else "cpu"
+        self.device_type = self.model_config.get("device_type", detected)
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
         self.max_concurrent_requests: int = self.model_config.get(
@@ -745,6 +764,11 @@ class Conductor:
             _cuda_op_available()
         ctx = mp.get_context("spawn")
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
+            owner = None
+            if self.runtime_extension is not None:
+                owner = self.runtime_extension.reserve_worker(self.runtime_admission, worker_id)
+                if owner is not None:
+                    self._runtime_owners[worker_id] = owner
             p = ctx.Process(
                 target=_worker_process_target,
                 kwargs={
@@ -768,10 +792,18 @@ class Conductor:
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
                     "status_interval_s": self._status_interval_s,
+                    "runtime_owner": owner,
                 },
                 daemon=False,
             )
-            p.start()
+            try:
+                p.start()
+            except BaseException:
+                if owner is not None:
+                    # Spawn may fail after creating the child but before
+                    # returning its handle; absence of a pid proves no release.
+                    owner.unknown("worker spawn did not report successful startup")
+                raise
             self._worker_processes.append(p)
 
         atexit.register(self.shutdown)
@@ -790,9 +822,14 @@ class Conductor:
         for p in self._worker_processes:
             if p.is_alive():
                 p.terminate()
-        for p in self._worker_processes:
+        for worker_id, p in zip(self.worker_ids, self._worker_processes, strict=False):
             p.join(timeout=5)
             if p.is_alive():
+                owner = getattr(self, "_runtime_owners", {}).get(worker_id)
+                if owner is not None and owner.status() != "released":
+                    owner.unknown("worker did not acknowledge native release during shutdown")
+                    logger.error("Worker %s remains held; automatic SIGKILL is disabled", worker_id)
+                    continue
                 logger.warning(
                     "Worker pid %s did not exit on SIGTERM; killing", p.pid)
                 p.kill()
@@ -831,6 +868,11 @@ class Conductor:
         if now < self._next_liveness_check:
             return
         self._next_liveness_check = now + self._liveness_interval_s
+        for worker_id, owner in getattr(self, "_runtime_owners", {}).items():
+            if owner.status() == "held":
+                message = f"worker {worker_id} holds uncertain native work; deployment is stopping"
+                self._fail_all_requests(message)
+                raise BackendFatalError(message)
         dead = self._dead_workers()
         if not dead:
             return

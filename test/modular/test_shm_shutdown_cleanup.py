@@ -216,7 +216,7 @@ def test_a_worker_stopped_with_requests_in_flight_leaves_no_tensor_files(tmp_pat
             # SIGTERM follows at once.
             os.kill(p.pid, signal.SIGINT)
     finally:
-        Conductor.shutdown(SimpleNamespace(_worker_processes=[p]))
+        Conductor.shutdown(SimpleNamespace(_worker_processes=[p], worker_ids=["worker_0"]))
         if arena:
             # its segments' namespace lock, which outlives the deployment until a later startup sweeps it
             ns = _deployment_namespace(_DeploymentCommunicator(prefix))
@@ -240,7 +240,7 @@ def test_without_a_launch_token_a_stopped_worker_leaves_its_files(tmp_path, monk
         held = _namespace_files(shm_dir, prefix)
         assert len(held) == N_IN_FLIGHT
     finally:
-        Conductor.shutdown(SimpleNamespace(_worker_processes=[p]))
+        Conductor.shutdown(SimpleNamespace(_worker_processes=[p], worker_ids=["worker_0"]))
     assert _namespace_files(shm_dir, prefix) == held
 
 
@@ -509,7 +509,7 @@ def test_a_worker_killed_in_a_hung_teardown_leaves_no_arena_segments(tmp_path):
     try:
         assert ready.wait(120), "worker did not start"
         assert _segments(), "the arena grew no segment"
-        Conductor.shutdown(SimpleNamespace(_worker_processes=[p]))
+        Conductor.shutdown(SimpleNamespace(_worker_processes=[p], worker_ids=["worker_0"]))
         assert p.exitcode == -signal.SIGKILL, "the teardown did not hang"
         left = _segments()
     finally:

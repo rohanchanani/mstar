@@ -598,6 +598,10 @@ class TensorStore:
     def get_tensor(self, uuid: int) -> torch.Tensor:
         return self._tensors[uuid]
 
+    def owned_uuids(self) -> tuple[int, ...]:
+        """Snapshot for transport shutdown after all readers have settled."""
+        return tuple(self._tensors)
+
     def get_cpu_tensor(self, uuid: int) -> torch.Tensor | None:
         """The host copy stored alongside ``uuid``, if the producer gave one."""
         return self._tensors_cpu.get(uuid)

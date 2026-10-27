@@ -434,10 +434,16 @@ class AsyncMooncakeReader:
             f.result()
         self._pending.clear()
 
-    def shutdown(self):
-        """Wait for pending writes and shut down the thread pool."""
-        self.wait_all()
+    def shutdown(self, *, raise_errors: bool = True):
+        """Join read submitters; their owner may classify failed transfers itself."""
         self._executor.shutdown(wait=True)
+        if raise_errors:
+            self.wait_all()
+        else:
+            # TensorCommunicationManager retains each read's future and uses
+            # its transfer-status evidence; a failed future alone is not proof
+            # that the transfer stopped.
+            self._pending.clear()
 
 
 class TrackedMooncakeReader(AsyncMooncakeReader):
@@ -2068,6 +2074,38 @@ class TensorCommunicationManager(ABC):
         """
         self.cleanup_request(request_id, force=True)
 
+    def shutdown(self) -> None:
+        """Release transport owners only after upstream read tracking proves safety.
+
+        A failed read future need not mean its transfers stopped. Preserve the
+        upstream retained-buffer owners on refusal; managed teardown holds this
+        manager alive rather than acknowledging native release.
+        """
+        reader = getattr(self, "_async_reader", None)
+        if reader is not None:
+            reader.shutdown(raise_errors=False)
+        for pending in self.pending:
+            if pending.future is not None:
+                try:
+                    pending.future.result()
+                except Exception:
+                    # Classify the failure below using upstream's transfer
+                    # status machinery, rather than treating it as completion.
+                    pass
+            _, error = self._poll_read(pending)
+            if error is not None:
+                self._keep_read_buffers(pending, error)
+        self.pending.clear()
+        self._release_kept_reads()
+        if self._kept_reads or self._unreleasable_buffers:
+            raise RuntimeError("Transport shutdown cannot establish that retained transfers stopped")
+        self._shutdown_storage()
+        self.buffered_shards.clear()
+
+    def _shutdown_storage(self) -> None:
+        for uuid in self.tensor_store.owned_uuids():
+            self._cleanup_by_uuid(uuid)
+
     #: True when no other launch can write a file under this manager's names
     #: (see ``SharedMemoryCommunicationManager``); irrelevant to transports
     #: that write no files.
@@ -2738,6 +2776,15 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             except FileNotFoundError:
                 pass
         self.tensor_store.remove_tensor(uuid)
+
+    def _shutdown_storage(self) -> None:
+        # Same exit-time naming guard as the conductor. Unlinking is distinct
+        # from releasing this process's tensor/arena storage.
+        if self.names_unique_per_launch:
+            self.unlink_owned_files()
+        else:
+            self._shm_files.clear()
+        super()._shutdown_storage()
 
     def unlink_owned_files(self) -> None:
         """Unlink every tensor file this manager wrote that is still waiting

@@ -989,6 +989,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         super().unlink_owned_files()
         _unlink_paths(list(self._own_segment_paths))
 
+    def shutdown(self) -> None:
+        super().shutdown()
+        self.close()
+
     def close(self) -> None:
         """Stop the wake watcher and unregister every pinned segment (the
         segments themselves unmap with the arena's Drop once the manager is
