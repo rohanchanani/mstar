@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.distributed.communication import CommGroup, WorkerParallelGroups
 from mstar.distributed.execution import ExecutionAgreement, InstanceFatalError
+from mstar.engine.engine import Engine
 from mstar.engine.execution import ExecutionCapabilities, ExecutionOption, InvocationFacts, Support
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.binding import build_bound_resource, resolve_bound_specs
@@ -28,6 +29,7 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.model.binding import NodeAssembly
 
 
 class Lease:
@@ -173,3 +175,15 @@ def test_admission_exception_releases_successful_peers_and_is_instance_fatal():
     with pytest.raises(InstanceFatalError, match="rollback failed"):
         agreement.admit(runner, step, ("request-a",))
     assert rolled_back == [step]
+
+
+def test_binding_disagreement_precedes_resource_allocation():
+    joint = SimpleNamespace(world_size=2, all_gather_object=lambda value: [value, ("binding", "different plan")])
+    groups = SimpleNamespace(get_joint_group_for_node=lambda _: joint)
+    engine = Engine(None)
+    with pytest.raises(InstanceFatalError, match="binding before allocation"):
+        engine.load_model({"decoder": object()}, [_spec()], groups, torch.device("cpu"), None,
+                          kv_cache_type=torch.float32,
+                          assemblies={"decoder": NodeAssembly(lambda _: None, execution_names=("book",))},
+                          resource_requests={"kv": (DenseSequenceView(),)})
+    assert not engine._resources

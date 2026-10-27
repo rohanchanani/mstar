@@ -14,6 +14,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
+from mstar.distributed.execution import ExecutionAgreement, structural_resource_identity
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
@@ -37,8 +38,11 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.binding import build_bound_resource, resolve_bound_specs
+from mstar.engine.resources.kv.config import KVSpec, SequenceKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sequence import HeadSharded, PagedSequenceView
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -510,6 +514,9 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        assemblies=None,
+        bindings=None,
+        resource_requests=None,
     ):
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
@@ -520,7 +527,63 @@ class Engine:
 
         node_names = set(submodules.keys())
         node_to_resources = {}
+        bound_nodes = set(assemblies or {})
+        default_nodes = node_names - bound_nodes
+        device_plan_resources = frozenset().union(*(
+            assembly.device_plan_resources for assembly in (assemblies or {}).values()
+        ))
         specs_by_key = resolve_spec_dependencies(specs)
+        if any(isinstance(spec, KVSpec) and isinstance(spec.config, SequenceKVConfig)
+               for spec in specs if spec.nodes & node_names):
+            local_keys = {spec.resource_key for spec in specs if spec.nodes & node_names}
+            pending_keys = list(local_keys)
+            while pending_keys:
+                for dependency in specs_by_key[pending_keys.pop()].depends_on():
+                    if dependency not in local_keys:
+                        local_keys.add(dependency)
+                        pending_keys.append(dependency)
+            physical_requests = dict(resource_requests or {})
+            for spec in specs:
+                if (spec.resource_key in local_keys and spec.nodes & default_nodes
+                        and isinstance(spec, KVSpec) and isinstance(spec.config, SequenceKVConfig)):
+                    # The retained reference uses its original head-sharded,
+                    # paged representation. This is a physical consumer choice,
+                    # not a mutation of the model's logical declaration.
+                    physical_requests[spec.resource_key] = (
+                        *physical_requests.get(spec.resource_key, ()),
+                        PagedSequenceView(partition=HeadSharded(), device_plan=True),
+                    )
+            resolved = resolve_bound_specs(
+                [spec for spec in specs if spec.resource_key in local_keys],
+                physical_requests, dtype=kv_cache_type,
+                group_sizes={
+                    spec.resource_key: parallel_groups.get_joint_group_for_node(
+                        next(iter(spec.nodes & node_names))
+                    ).world_size
+                    for spec in specs if spec.nodes & node_names
+                },
+            )
+            specs_by_key.update((spec.resource_key, spec) for spec in resolved)
+            specs = [specs_by_key[spec.resource_key] for spec in specs]
+
+        self._execution_agreements = {}
+        for node in sorted(bound_nodes):
+            group = parallel_groups.get_joint_group_for_node(node)
+            if group.world_size > 1:
+                agreement = ExecutionAgreement(group, node)
+                agreement.agree((
+                    assemblies[node].execution_names,
+                    structural_resource_identity(tuple(
+                        specs_by_key[key] for key in sorted(specs_by_key) if node in specs_by_key[key].nodes
+                    )),
+                    structural_resource_identity({
+                        key: requests for key, requests in (resource_requests or {}).items()
+                        if key in specs_by_key and node in specs_by_key[key].nodes
+                    }),
+                    tuple(sorted(assemblies[node].device_plan_resources)),
+                    kv_cache_type,
+                ), "binding before allocation")
+                self._execution_agreements[node] = agreement
 
         self._classify_tp_roles(node_names, parallel_groups)
 
@@ -536,25 +599,31 @@ class Engine:
             joint_comm_group = parallel_groups.get_joint_group_for_node(
                 next(iter(relevant_nodes))
             )
-            self._resources[spec.resource_key] = build_resource(
-                spec,
-                EngineResourceInfo(
-                    device=device,
-                    joint_comm_group=joint_comm_group,
-                    transfer_engine_info=transfer_engine_info,
-                    kv_dtype=kv_cache_type,
-                    needs_remote_transfer=(
-                        parallel_groups.resource_needs_remote_transfer(
-                            spec.nodes, relevant_nodes
-                        )
-                    ),
-                    dependencies={
-                        key: specs_by_key[key] for key in spec.depends_on()
-                    },
-                    max_rows_in_combined=self._max_rows_in_combined(
-                        spec.resource_key, relevant_nodes, submodules, model,
-                    ),
+            info = EngineResourceInfo(
+                device=device,
+                joint_comm_group=joint_comm_group,
+                transfer_engine_info=transfer_engine_info,
+                kv_dtype=kv_cache_type,
+                needs_remote_transfer=(
+                    parallel_groups.resource_needs_remote_transfer(
+                        spec.nodes, relevant_nodes
+                    )
                 ),
+                dependencies={
+                    key: specs_by_key[key] for key in spec.depends_on()
+                },
+                max_rows_in_combined=self._max_rows_in_combined(
+                    spec.resource_key, relevant_nodes, submodules, model,
+                ),
+            )
+            self._resources[spec.resource_key] = (
+                build_bound_resource(
+                    spec, info, (resource_requests or {}).get(spec.resource_key, ()),
+                    device_plan_required=(spec.resource_key in device_plan_resources
+                                          or bool(relevant_nodes & default_nodes)),
+                    default_kernel_required=bool(relevant_nodes & default_nodes),
+                )
+                if relevant_nodes & bound_nodes else build_resource(spec, info)
             )
 
             for node in relevant_nodes:
@@ -574,7 +643,8 @@ class Engine:
 
         self._open_prefix_caches(specs_by_key, model)
 
-        for node_name, submodule in submodules.items():
+        for node_name in sorted(submodules):
+            submodule = submodules[node_name]
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
             # `postprocess_batch` are not, so anything they derive from a
             # parameter would build a graph and pin its intermediates — for the
@@ -592,6 +662,22 @@ class Engine:
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
+            if assemblies and node_name in assemblies:
+                agreement = self.execution_agreement(node_name)
+                if agreement is None:
+                    capabilities = assemblies[node_name].bind(resources)
+                    submodule.bind_execution(bindings[node_name], capabilities)
+                else:
+                    with agreement.executing():
+                        capabilities = assemblies[node_name].bind(resources)
+                        submodule.bind_execution(bindings[node_name], capabilities)
+                        agreement.complete()
+            capabilities = submodule.execution_capabilities
+            if capabilities is not None and capabilities.fixed_option is not None:
+                management = self._submodules[node_name]
+                management.tensor_program = capabilities.fixed_option.runner
+                management.forward = management.physical.forward
+                management.forward_batched = getattr(management.physical, "forward_batched", None)
             if getattr(submodule, "reads_device_loopback", False):
                 # the sampler keeps its slot masters only for a node that
                 # reads them back on the device (see NodeSubmodule)
@@ -2754,5 +2840,24 @@ class Engine:
         return freed
 
     def shutdown(self):
+        for management in self._submodules.values():
+            submodule = management.submodule
+            if submodule.execution_capabilities is not None:
+                submodule.execution_capabilities.close()
+                submodule.execution_capabilities = None
+            if submodule.binding is not None:
+                submodule.binding.prepared.clear()
+                submodule.binding = None
+            submodule.request_states.clear()
+            submodule.node_resources.clear()
         for resource in self._resources.values():
             resource.cleanup()
+        self._submodules.clear()
+        self._resources.clear()
+        self._runner = None
+
+    def execution_agreement(self, node_name: str):
+        return getattr(self, "_execution_agreements", {}).get(node_name)
+
+    def execution_capabilities(self, node_name: str):
+        return self._submodules[node_name].submodule.execution_capabilities

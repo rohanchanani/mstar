@@ -173,3 +173,46 @@ def test_engine_prepares_all_before_planning_and_forwards_each_selection(monkeyp
                       ("compile", "nodes"), ("compile", "first"), ("compile", "second")]
     # A small capture ceiling does not redefine supported invocations.
     assert engine.get_max_batch_size("bound", "decode") == 3
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+def test_engine_assembly_binds_physical_program_and_releases_owned_state(fixed):
+    from mstar.distributed.communication import WorkerParallelGroups
+    from mstar.engine.execution import Support
+    from mstar.engine.tensor_forward import bind_tensor_forward
+    from mstar.model.binding import NodeAssembly
+
+    shell = Shell()
+    groups = WorkerParallelGroups(1, 0)
+    group = groups.get_joint_group_for_node("bound")
+    binding = SimpleNamespace(submodule=shell, node_name="bound", device=torch.device("cpu"),
+                              tp_group=group.tp_group, sp_group=group.sp_group, prepared={"packed": object()})
+    closed = []
+    program = Program()
+    option = bind_tensor_forward("physical", lambda _: Support.YES, binding, {}, TensorForward(
+        program, autocast_dtype=torch.bfloat16,
+        capture=CapturePolicy(enabled=True, compile=CompilePolicy(enabled=False)),
+        close=lambda: closed.append("program"),
+    ))
+    caps = ExecutionCapabilities((option,), {"decode": 3}, fixed_option=option if fixed else None)
+
+    def bind(resources):
+        assert shell.node_resources is resources or shell.node_resources == resources
+        return caps
+
+    engine = Engine(None)
+    engine.load_model({"bound": shell}, [], groups, torch.device("cpu"), None,
+                      assemblies={"bound": NodeAssembly(bind)}, bindings={"bound": binding})
+    assert shell.binding is binding
+    assert engine.execution_capabilities("bound") is caps
+    assert engine.execution_agreement("bound") is None
+    management = engine._submodules["bound"]
+    if fixed:
+        assert management.tensor_program is option.runner
+        assert management.forward.__self__ is program
+    else:
+        assert management.tensor_program is None
+    engine.shutdown()
+    assert closed == ["program"] and binding.prepared == {}
+    assert shell.binding is None and shell.execution_capabilities is None
+    assert not engine._submodules and not engine._resources and engine._runner is None
