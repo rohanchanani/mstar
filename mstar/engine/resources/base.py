@@ -243,6 +243,15 @@ class Resource(ABC):
         """ret is immutable and opaque to runner; only gives to `ctx.plan_results`"""
         return None
 
+    def accept_result(self, result: Any, ctx: StepContext) -> None:
+        """Bind an implementation-produced resource result before commit.
+
+        Resource results carry physical outputs; only the resource commits its
+        logical effects. Resources with no returned effects need no override.
+        """
+        raise TypeError(f"{type(self).__name__} does not consume a resource result")
+
+
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         """record step consumption"""
         return

@@ -117,6 +117,39 @@ class SamplingReqConfig(ResourceReqConfig):
             )
 
 
+# Below this threshold every sampler resolves to greedy before selection.
+GREEDY_TEMPERATURE = 1e-5
+
+
+def canonical_sampling_values(temperature, top_k, top_p, min_p):
+    """Resolve the shared numerical meaning of sampling policy knobs."""
+    if temperature < GREEDY_TEMPERATURE:
+        return 0.0, 0, 1.0, 0.0
+    top_k = int(top_k) if int(top_k) < 2**31 else 0
+    return float(temperature), top_k, float(top_p), float(min_p)
+
+
+def sampling_policy_facts(config: SamplingReqConfig | None = None):
+    """Selection snapshot, excluding mutable RNG and token history.
+
+    Accepts request overrides or the sampler's resolved config. ``None`` fields
+    take the same defaults as a fresh request; a near-zero temperature has the
+    same greedy meaning before ingestion and during serving.
+    """
+    defaults = SamplingReqConfig()
+    names = ("temperature", "top_k", "top_p", "min_p", "repetition_penalty",
+             "ignore_eos", "penalize_prompt", "repetition_window", "min_tokens",
+             "top_p_first", "top_p_min_keep")
+    facts = {name: getattr(config, name, None) for name in names}
+    facts = {name: getattr(defaults, name) if value is None else value
+             for name, value in facts.items()}
+    (facts["temperature"], facts["top_k"], facts["top_p"],
+     facts["min_p"]) = canonical_sampling_values(
+        facts["temperature"], facts["top_k"], facts["top_p"], facts["min_p"],
+    )
+    return facts
+
+
 def derive_seed(seed: int, stream: str) -> int:
     """A seed for one named stream of a request, as a non-negative int64.
 

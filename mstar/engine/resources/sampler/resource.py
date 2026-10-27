@@ -1,5 +1,6 @@
 
 
+from collections.abc import Callable
 from dataclasses import asdict
 
 import torch
@@ -10,13 +11,16 @@ from mstar.engine.resources.sampler.config import (
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
+    sampling_policy_facts,
 )
+from mstar.engine.resources.sampler.plan import SamplingPlan, SamplingResult
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
     GenerationHistory,
     Sampler,
     SamplerBuffers,
     SamplingConfig,
+    _rng_offset_stride,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
@@ -28,7 +32,7 @@ class SamplerResource(Resource):
     prefix_skip_safe = True
 
     def can_capture(self) -> bool:
-        return DeviceCapability.of(self._device).graph_backend is not None
+        return not self._planned and DeviceCapability.of(self._device).graph_backend is not None
 
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,
     # we should rip out the parts we need from sampling.py and discard the rest.
@@ -42,7 +46,16 @@ class SamplerResource(Resource):
         max_repetition_window: int = 0,
         min_tokens_stop_ids: tuple[int, ...] = (),
         enable_top_p_first: bool = False,
+        *,
+        planned: bool = False,
+        sample: Callable[[torch.Tensor, SamplingPlan], torch.Tensor] | None = None,
+        offset_stride: int = 1,
     ):
+        self._planned = planned
+        self._physical_sample = sample
+        self._offset_stride = offset_stride
+        self._sampling_plan: SamplingPlan | None = None
+        self._sampling_result: SamplingResult | None = None
         self._track_seen_tokens = enable_repetion_penalty
         self._enable_min_p = enable_min_p
         self._vocab_size = vocab_size if self._track_seen_tokens else None
@@ -246,12 +259,21 @@ class SamplerResource(Resource):
                 f"{cfg.top_p_min_keep} but the node's SamplerSpec has "
                 "enable_top_p_first=False"
             )
-        if (cfg.uses_history or cfg.uses_filter_order) and self._sampler.device.type != "cuda":
+        if (
+            (cfg.uses_history or cfg.uses_filter_order)
+            and self._sampler.device.type != "cuda"
+            and not (self._planned and self._device.type == "cpu")
+        ):
             return (
                 "asks for repetition_window, min_tokens, top_p_first or "
-                f"top_p_min_keep, which are CUDA-only (device {self._sampler.device})"
+                f"top_p_min_keep, which are CUDA-only for the built-in device sampler (device {self._sampler.device})"
             )
         return None
+
+    def policy_facts(self, request_ids):
+        """Canonical policy owned by this sampler, in invocation row order."""
+        return tuple(sampling_policy_facts(self._sampler._sampling_config[rid])
+                     for rid in request_ids)
 
     def ingest_capture_row(self, rid: str):
         """A capture padding row: default config, no seen-token mask, and the
@@ -328,14 +350,14 @@ class SamplerResource(Resource):
 
     @property
     def supports_preplan(self):
-        return True
+        return not self._planned
 
     @property
     def force_double_buffer(self):
         # Per-step gather indices are staged into a reused pinned buffer
         # (``_slot_idx_cpu``) behind an async H2D, so a single-buffered region
         # (a piecewise runner with no pre-plan) races when the host runs ahead.
-        return True
+        return not self._planned
 
     def clear_preplan(self):
         self._preplanned = False
@@ -368,6 +390,25 @@ class SamplerResource(Resource):
                 if skipped is not None and configs[rid].penalize_prompt:
                     for tokens in skipped.values():
                         self._sampler.get_token_mask(rid).add_tokens(tokens)
+
+        if self._planned:
+            rids = tuple(ctx.request_ids)
+            configs = tuple(self._sampler._sampling_config[rid] for rid in rids)
+            history, rows = self._sampler._gather_history(rids, configs)
+            self._sampling_history_rows = rows
+            self._sampling_plan = SamplingPlan(
+                request_ids=rids,
+                configs=configs,
+                offsets=tuple(self._sampler._step_offset[rid] for rid in rids),
+                kept=tuple(step.kept_rids is None or rid in step.kept_rids for rid in rids),
+                apply_penalty=self._apply_penalty_this_step,
+                offset_stride=self._offset_stride,
+                apply_filters=step.apply_filters,
+                history=history,
+                seen_tokens=tuple(self._sampler.get_token_mask(rid)._seen_token_mask for rid in rids),
+            )
+            self._sampling_result = None
+            return self._sampling_plan
 
         # A step planned ahead promotes here. Its static config was gathered in
         # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
@@ -439,7 +480,29 @@ class SamplerResource(Resource):
         if self._history is not None:
             self._history.gather_step(ctx.request_ids, padded_bs)
 
+    def accept_result(self, result: SamplingResult, ctx: StepContext) -> None:
+        """Record submitted token storage. Logical effects wait for commit."""
+        if not self._planned:
+            return super().accept_result(result, ctx)
+        self._sampling_result = result
+
     def commit(self, step: SamplerStep, ctx: StepContext):
+        if self._planned:
+            plan, result = self._sampling_plan, self._sampling_result
+            if plan is None or result is None:
+                raise RuntimeError("planned sampling commit requires this invocation's result")
+            # Clear before bookkeeping, so a second commit cannot consume it.
+            self._sampling_result = None
+            self._sampler.complete_draw(
+                plan.request_ids, result.tokens,
+                kept_rids=None if all(plan.kept) else frozenset(
+                    rid for rid, kept in zip(plan.request_ids, plan.kept, strict=True) if kept
+                ),
+                history=plan.history, rows=self._sampling_history_rows,
+                track_seen=self._penalty_needed_this_step,
+                offset_stride=plan.offset_stride,
+            )
+            return
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
@@ -486,6 +549,12 @@ class SamplerResource(Resource):
         which is what the graph sampler's per-row params were gathered for.
         The eager sampler keys off request ids and sees the real batch only.
         """
+        if self._planned:
+            if self._physical_sample is None:
+                raise RuntimeError("this sampler is computed by the selected node program")
+            tokens = self._physical_sample(logits, self._sampling_plan)
+            self._sampling_result = SamplingResult(tokens)
+            return tokens
         if self._cg_sampler is not None:
             # The capability flag, not the liveness one. Under a replay this
             # argument is inert (the kernel variant was baked at capture), and
@@ -497,10 +566,18 @@ class SamplerResource(Resource):
                 apply_penalty=self._apply_penalty_this_step,
                 apply_filters=self._apply_filters_this_step,
             )
+        bufs = self._cg_buffers
+        use_master_offsets = bufs is not None and all(bufs.has_slot(rid) for rid in request_ids)
+        offsets = bufs.offsets_for(request_ids) if use_master_offsets else None
         tokens = self._sampler.sample(
             request_ids, logits, apply_penalty=self._apply_penalty_this_step,
-            apply_filters=self._apply_filters_this_step, kept_rids=self._kept_rids,
+            apply_filters=self._apply_filters_this_step, kept_rids=self._kept_rids, rand_offset=offsets,
         )
+        if use_master_offsets:
+            bufs.advance_offsets(
+                request_ids, offsets, _rng_offset_stride(logits.device.type, logits.shape[-1]),
+                kept_rids=self._kept_rids,
+            )
         # An eager step has no per-step row to scatter from: write the masters
         # by request, so the next step can still read its token on the device.
         bufs = self._cg_buffers

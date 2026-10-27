@@ -24,9 +24,11 @@ from typing import Any, ClassVar
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 
+from mstar.engine.resources.sampler.config import GREEDY_TEMPERATURE as GREEDY_TEMPERATURE  # noqa: PLC0414
+from mstar.engine.resources.sampler.config import canonical_sampling_values
+from mstar.platforms import current_platform
+from mstar.platforms.dispatch import PlatformDispatch
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import sampler_slots
@@ -56,153 +58,6 @@ def _xpu_generator_seed_offset(
     return seed, offset
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 4096},  num_warps=4,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 8192},  num_warps=4,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 8192},  num_warps=8,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 16384}, num_warps=8,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 16384}, num_warps=16, num_stages=2),
-        triton.Config({"BLOCK_SIZE": 32768}, num_warps=16, num_stages=2),
-        triton.Config({"BLOCK_SIZE": 32768}, num_warps=32, num_stages=2),
-    ],
-    key=["V", "APPLY_PENALTY", "INCLUDE_GREEDY", "WINDOW", "NUM_STOP"],
-)
-@triton.jit
-def _fused_sampling_prep_kernel(
-    logits_ptr,        # [B, V] input
-    temperature_ptr,   # [B]
-    penalty_ptr,       # [B] (only read when APPLY_PENALTY=True)
-    seen_mask_ptr,     # [B, V] bool (only read when APPLY_PENALTY=True)
-    hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,  # see _history_adjust
-    probs_ptr,         # [B, V] float32 output
-    V,
-    stride_b, stride_v,
-    out_stride_b, out_stride_v,
-    mask_stride_b, mask_stride_v,
-    BLOCK_SIZE: tl.constexpr,
-    APPLY_PENALTY: tl.constexpr,
-    INCLUDE_GREEDY: tl.constexpr,
-    WINDOW: tl.constexpr,
-    NUM_STOP: tl.constexpr,
-):
-    """Fused (optional rep penalty) + (logits/temperature) + softmax.
-
-    When INCLUDE_GREEDY is True and a row's temperature == 0, the kernel
-    emits a one-hot distribution at the argmax instead of a temperature-scaled
-    softmax — so a downstream multinomial sampler deterministically returns
-    the argmax token (replaces the separate torch.argmax + torch.where pair).
-
-    Both constexprs specialize at compile time; the unused branches compile out.
-    """
-    row = tl.program_id(0)
-    temp = tl.load(temperature_ptr + row)
-    if INCLUDE_GREEDY:
-        is_greedy = temp == 0
-        # Safe inv_temp so the softmax branch doesn't produce NaN for greedy
-        # rows (their output is overwritten by the one-hot anyway).
-        inv_temp = tl.where(is_greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
-    else:
-        inv_temp = 1.0 / temp
-
-    if APPLY_PENALTY:
-        penalty = tl.load(penalty_ptr + row)
-
-    # Pass 1: scan over V, compute max of raw vals (post-penalty) + argmax.
-    # argmax is only used by the greedy one-hot path; still tracked when
-    # INCLUDE_GREEDY is True regardless of per-row temp.
-    max_raw = -float("inf")
-    max_idx = tl.zeros([], dtype=tl.int32)
-    for v_start in range(0, V, BLOCK_SIZE):
-        offs = v_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < V
-        vals = tl.load(
-            logits_ptr + row * stride_b + offs * stride_v,
-            mask=mask, other=-float("inf"),
-        )
-        if APPLY_PENALTY:
-            seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
-                mask=mask, other=0,
-            ).to(tl.int1)
-            penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
-            vals = tl.where(seen, penalized, vals)
-        vals = _history_adjust(
-            vals, offs, row, temp, hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
-            WINDOW, NUM_STOP,
-        )
-        masked_vals = tl.where(mask, vals, -float("inf"))
-        block_max = tl.max(masked_vals)
-        if INCLUDE_GREEDY:
-            block_argmax = tl.argmax(masked_vals, axis=0)
-            is_new = block_max > max_raw
-            max_idx = tl.where(is_new, v_start + block_argmax.to(tl.int32), max_idx)
-        max_raw = tl.maximum(max_raw, block_max)
-
-    max_scaled = max_raw * inv_temp
-
-    # Pass 2: exp(scaled - max_scaled), accumulate sum
-    sum_exp = tl.zeros([], dtype=tl.float32)
-    for v_start in range(0, V, BLOCK_SIZE):
-        offs = v_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < V
-        vals = tl.load(
-            logits_ptr + row * stride_b + offs * stride_v,
-            mask=mask, other=0.0,
-        )
-        if APPLY_PENALTY:
-            seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
-                mask=mask, other=0,
-            ).to(tl.int1)
-            penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
-            vals = tl.where(seen, penalized, vals)
-        vals = _history_adjust(
-            vals, offs, row, temp, hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
-            WINDOW, NUM_STOP,
-        )
-        scaled = vals * inv_temp
-        exp_val = tl.exp(scaled - max_scaled)
-        exp_val = tl.where(mask, exp_val, 0.0)
-        sum_exp += tl.sum(exp_val)
-
-    # Avoid div-by-zero in the greedy rows (their output is overwritten).
-    inv_sum = 1.0 / tl.maximum(sum_exp, 1e-30)
-
-    # Pass 3: write the output — softmax probs for non-greedy rows,
-    # one-hot at argmax for greedy rows.
-    for v_start in range(0, V, BLOCK_SIZE):
-        offs = v_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < V
-        vals = tl.load(
-            logits_ptr + row * stride_b + offs * stride_v,
-            mask=mask, other=0.0,
-        )
-        if APPLY_PENALTY:
-            seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
-                mask=mask, other=0,
-            ).to(tl.int1)
-            penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
-            vals = tl.where(seen, penalized, vals)
-        vals = _history_adjust(
-            vals, offs, row, temp, hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
-            WINDOW, NUM_STOP,
-        )
-        scaled = vals * inv_temp
-        softmax_val = tl.exp(scaled - max_scaled) * inv_sum
-        if INCLUDE_GREEDY:
-            is_max = offs == max_idx
-            one_hot = tl.where(is_max, 1.0, 0.0)
-            probs = tl.where(is_greedy, one_hot, softmax_val)
-        else:
-            probs = softmax_val
-        tl.store(
-            probs_ptr + row * out_stride_b + offs * out_stride_v,
-            probs, mask=mask,
-        )
-
-
 # ---------------------------------------------------------------------------
 # Split-V variant of the above.
 #
@@ -211,190 +66,6 @@ def _fused_sampling_prep_kernel(
 # occupancy with B x NSPLIT, and an online softmax reads the logits twice.
 # Measured well under the single kernel for Qwen3.5's 248k vocab.
 # ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _history_adjust(
-    vals, offs, row, temp, hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
-    WINDOW: tl.constexpr, NUM_STOP: tl.constexpr,
-):
-    """The ``HistoryRows`` processors on one tile of a row's logits: the windowed
-    frequency penalty (``penalty ** n``, n the token's count among the row's
-    ring of recent tokens, sign-aware like the presence penalty), and the
-    stop-id floor for greedy rows (sampled rows are floored after the filter,
-    in ``apply_min_tokens_floor``). Both compile out when off."""
-    if WINDOW > 0:
-        pen = tl.load(wpen_ptr + row)
-        factor = tl.zeros_like(vals) + 1.0
-        for w in tl.static_range(WINDOW):
-            tok = tl.load(hist_ptr + row * hist_stride + w)
-            factor = tl.where(offs == tok, factor * pen, factor)
-        vals = tl.where(vals > 0, vals / factor, vals * factor)
-    if NUM_STOP > 0:
-        floor = (temp == 0) & (tl.load(count_ptr + row) < tl.load(min_tok_ptr + row))
-        for s in tl.static_range(NUM_STOP):
-            vals = tl.where(floor & (offs == tl.load(stop_ptr + s)), -float("inf"), vals)
-    return vals
-
-
-@triton.jit
-def _penalize(vals, seen, penalty):
-    """Repetition penalty: divide positive logits, multiply negative ones."""
-    return tl.where(seen, tl.where(vals > 0, vals / penalty, vals * penalty), vals)
-
-
-@triton.jit
-def _split_partials_kernel(
-    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
-    hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
-    chunk_max_ptr, chunk_sum_ptr, chunk_arg_ptr,
-    V, CHUNK,
-    stride_b, stride_v, mask_stride_b, mask_stride_v, part_stride_b,
-    BLOCK_SIZE: tl.constexpr,
-    APPLY_PENALTY: tl.constexpr,
-    INCLUDE_GREEDY: tl.constexpr,
-    WINDOW: tl.constexpr,
-    NUM_STOP: tl.constexpr,
-):
-    row = tl.program_id(0)
-    split = tl.program_id(1)
-    temp = tl.load(temperature_ptr + row)
-    if INCLUDE_GREEDY:
-        inv_temp = tl.where(temp == 0, 1.0, 1.0 / tl.maximum(temp, 1e-30))
-    else:
-        inv_temp = 1.0 / temp
-    if APPLY_PENALTY:
-        penalty = tl.load(penalty_ptr + row)
-
-    lo = split * CHUNK
-    hi = tl.minimum(lo + CHUNK, V)
-
-    # Online softmax over this chunk: one read, running max and sum.
-    run_max = -float("inf")
-    run_sum = tl.zeros([], dtype=tl.float32)
-    arg = tl.zeros([], dtype=tl.int32)
-    for v_start in range(lo, hi, BLOCK_SIZE):
-        offs = v_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < hi
-        vals = tl.load(
-            logits_ptr + row * stride_b + offs * stride_v,
-            mask=mask, other=-float("inf"),
-        ).to(tl.float32)
-        if APPLY_PENALTY:
-            seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
-                mask=mask, other=0,
-            ).to(tl.int1)
-            vals = _penalize(vals, seen, penalty)
-        vals = _history_adjust(
-            vals, offs, row, temp, hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
-            WINDOW, NUM_STOP,
-        )
-        scaled = tl.where(mask, vals * inv_temp, -float("inf"))
-        block_max = tl.max(scaled)
-        if INCLUDE_GREEDY:
-            is_new = block_max > run_max
-            arg = tl.where(
-                is_new, v_start + tl.argmax(scaled, axis=0).to(tl.int32), arg,
-            )
-        new_max = tl.maximum(run_max, block_max)
-        # rescale what we had, then fold this block in. Guard both terms while
-        # no finite logit has been seen: `-inf - -inf` is NaN, and an all -inf
-        # leading block would carry a NaN sum into the combine step.
-        rescale = tl.where(run_max == -float("inf"), 0.0, tl.exp(run_max - new_max))
-        terms = tl.where(
-            mask & (scaled > -float("inf")), tl.exp(scaled - new_max), 0.0
-        )
-        run_sum = run_sum * rescale + tl.sum(terms)
-        run_max = new_max
-
-    base = row * part_stride_b + split
-    tl.store(chunk_max_ptr + base, run_max)
-    tl.store(chunk_sum_ptr + base, run_sum)
-    if INCLUDE_GREEDY:
-        tl.store(chunk_arg_ptr + base, arg)
-
-
-@triton.jit
-def _split_combine_kernel(
-    chunk_max_ptr, chunk_sum_ptr, chunk_arg_ptr,
-    row_max_ptr, row_inv_sum_ptr, row_arg_ptr,
-    NSPLIT, part_stride_b,
-    BLOCK_N: tl.constexpr,
-    INCLUDE_GREEDY: tl.constexpr,
-):
-    """Fold the per-chunk partials into one max/sum/argmax per row."""
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_N)
-    mask = offs < NSPLIT
-    base = row * part_stride_b + offs
-    cmax = tl.load(chunk_max_ptr + base, mask=mask, other=-float("inf"))
-    csum = tl.load(chunk_sum_ptr + base, mask=mask, other=0.0)
-    gmax = tl.max(cmax)
-    # each chunk's sum is relative to its own max, so rescale before adding
-    gsum = tl.sum(tl.where(mask, csum * tl.exp(cmax - gmax), 0.0))
-    tl.store(row_max_ptr + row, gmax)
-    tl.store(row_inv_sum_ptr + row, 1.0 / tl.maximum(gsum, 1e-30))
-    if INCLUDE_GREEDY:
-        carg = tl.load(chunk_arg_ptr + base, mask=mask, other=0)
-        winner = tl.argmax(tl.where(mask, cmax, -float("inf")), axis=0)
-        tl.store(row_arg_ptr + row, tl.sum(tl.where(offs == winner, carg, 0)))
-
-
-@triton.jit
-def _split_write_kernel(
-    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
-    hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
-    row_max_ptr, row_inv_sum_ptr, row_arg_ptr, probs_ptr,
-    V, CHUNK,
-    stride_b, stride_v, out_stride_b, out_stride_v,
-    mask_stride_b, mask_stride_v,
-    BLOCK_SIZE: tl.constexpr,
-    APPLY_PENALTY: tl.constexpr,
-    INCLUDE_GREEDY: tl.constexpr,
-    WINDOW: tl.constexpr,
-    NUM_STOP: tl.constexpr,
-):
-    row = tl.program_id(0)
-    split = tl.program_id(1)
-    temp = tl.load(temperature_ptr + row)
-    if INCLUDE_GREEDY:
-        is_greedy = temp == 0
-        inv_temp = tl.where(is_greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
-        arg = tl.load(row_arg_ptr + row)
-    else:
-        inv_temp = 1.0 / temp
-    if APPLY_PENALTY:
-        penalty = tl.load(penalty_ptr + row)
-    gmax = tl.load(row_max_ptr + row)
-    inv_sum = tl.load(row_inv_sum_ptr + row)
-
-    lo = split * CHUNK
-    hi = tl.minimum(lo + CHUNK, V)
-    for v_start in range(lo, hi, BLOCK_SIZE):
-        offs = v_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < hi
-        vals = tl.load(
-            logits_ptr + row * stride_b + offs * stride_v,
-            mask=mask, other=0.0,
-        ).to(tl.float32)
-        if APPLY_PENALTY:
-            seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
-                mask=mask, other=0,
-            ).to(tl.int1)
-            vals = _penalize(vals, seen, penalty)
-        vals = _history_adjust(
-            vals, offs, row, temp, hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
-            WINDOW, NUM_STOP,
-        )
-        out = tl.exp(vals * inv_temp - gmax) * inv_sum
-        if INCLUDE_GREEDY:
-            out = tl.where(is_greedy, tl.where(offs == arg, 1.0, 0.0), out)
-        tl.store(
-            probs_ptr + row * out_stride_b + offs * out_stride_v,
-            out, mask=mask,
-        )
 
 
 # A fixed chunk, not one derived from the batch, so the block count scales with
@@ -420,6 +91,13 @@ def _split_v_softmax(
     apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
 ):
     """The three-kernel path; see the kernels above for why."""
+    import triton
+
+    from mstar.engine.resources.sampler.kernels import (
+        _split_combine_kernel,
+        _split_partials_kernel,
+        _split_write_kernel,
+    )
     B, V = logits.shape
     chunk = -(-V // nsplit)
     # sized to the chunk: a small block makes a long chunk many serial iterations
@@ -498,6 +176,7 @@ def fused_temperature_softmax(
     ``history`` adds its windowed penalty, and its stop-id floor for greedy
     rows, inside the same kernels.
     """
+    from mstar.engine.resources.sampler.kernels import _fused_sampling_prep_kernel
     B, V = logits.shape
     probs = torch.empty_like(logits, dtype=torch.float32)
     apply_penalty = penalty is not None and seen_mask is not None
@@ -601,78 +280,6 @@ FUSED_FILTER_MAX_VOCAB = 16384
 FUSED_FILTER_WARPS = 4
 
 
-@triton.jit
-def _count_ge(x_bits, t):
-    return tl.sum((x_bits >= t).to(tl.int32), axis=0)
-
-
-@triton.jit
-def _kth_largest_bits(x_bits, k):
-    """The largest threshold ``t`` (float bits) with at least ``k`` entries >= t:
-    the k-th largest value's bits. Non-negative floats order like their bits."""
-    lo = 0
-    hi = 0x7F800000
-    for _ in range(31):
-        mid = lo + (hi - lo + 1) // 2
-        ok = _count_ge(x_bits, mid) >= k
-        lo = tl.where(ok, mid, lo)
-        hi = tl.where(ok, hi, mid - 1)
-    return lo
-
-
-@triton.jit
-def _fused_filter_kernel(
-    probs_ptr, out_ptr, top_k_ptr, top_p_ptr, first_k_ptr, min_keep_ptr,
-    V, stride_in, stride_out,
-    HAS_MIN_KEEP: tl.constexpr, BLOCK: tl.constexpr,
-):
-    """``filter_top_k_top_p`` for one row, in registers: the top-p count of the
-    (top-k-first rows: renormalised top-k) distribution by a bitwise search for
-    its cutoff, raised to ``min_keep``, clipped to ``k``; then the top-``keep``
-    renorm. No sort and one launch for the batch."""
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK)
-    valid = offs < V
-    p = tl.load(probs_ptr + row * stride_in + offs, mask=valid, other=0.0)
-    p = tl.maximum(p, 0.0)
-    bits = p.to(tl.int32, bitcast=True)
-    k = tl.load(top_k_ptr + row)
-    first_k = tl.load(first_k_ptr + row)
-    top_p = tl.load(top_p_ptr + row)
-
-    # the set top-p runs over: the top-`first_k` (all of it for top-p-first rows)
-    t_first = 0
-    if first_k < V:  # a branch, not tl.where: skip the search when nothing is cut
-        t_first = _kth_largest_bits(bits, first_k)
-    in_first = bits >= t_first
-    mass_first = tl.sum(tl.where(in_first, p, 0.0), axis=0)
-    # top-p keeps token i iff the mass strictly above it is < p * mass. That mass
-    # falls as i's value rises, so the kept tokens are those >= the smallest
-    # threshold t with mass(> t) < p * mass: search for it on the bits
-    target = top_p * mass_first
-    lo = 0
-    hi = 0x7F800000
-    for _ in range(31):
-        mid = lo + (hi - lo) // 2
-        above = tl.sum(tl.where(in_first & (bits > mid), p, 0.0), axis=0)
-        ok = above < target
-        hi = tl.where(ok, mid, hi)
-        lo = tl.where(ok, lo, mid + 1)
-    n = _count_ge(bits, tl.maximum(lo, t_first))
-    # p = 1 removes nothing; the search can't say so, since "the mass above" the
-    # smallest tokens rounds to the whole mass in float32
-    n = tl.where(top_p >= 1.0, _count_ge(bits, t_first), n)
-    if HAS_MIN_KEEP:
-        n = tl.maximum(n, tl.load(min_keep_ptr + row))
-    keep = tl.minimum(n, k)
-    t_keep = 0
-    if keep < V:
-        t_keep = _kth_largest_bits(bits, keep)
-    out = tl.where(valid & (bits >= t_keep), p, 0.0)
-    total = tl.sum(out, axis=0)
-    tl.store(out_ptr + row * stride_out + offs, out / tl.maximum(total, 1e-30), mask=valid)
-
-
 def filter_top_k_top_p(
     probs: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     order: FilterOrder | None = None, fused: bool = True,
@@ -688,7 +295,35 @@ def filter_top_k_top_p(
       ``L = min(k, n_p)``, ``n_p`` what top-p keeps of the full distribution,
       raised to ``min_keep`` as HF's ``min_tokens_to_keep`` does.
     """
-    import flashinfer
+    if probs.device.type == "cpu":
+        # Same threshold semantics as the GPU filter, including tied values.
+        output = []
+        for i, p in enumerate(probs):
+            vocab = p.numel()
+            k = min(int(top_k[i]) or vocab, vocab)
+            first_k = vocab if order is not None and order.top_p_first[i] else k
+            threshold = p.topk(first_k).values[-1]
+            first = p.masked_fill(p < threshold, 0)
+            first = first / first.sum().clamp_min(1e-30)
+            if top_p[i] >= 1:
+                n = int((first > 0).sum())
+            else:
+                sorted_p = first.sort(descending=True).values
+                n = int((sorted_p.cumsum(0) - sorted_p < top_p[i]).sum())
+            if order is not None:
+                n = max(n, int(order.min_keep[i]))
+            threshold = p.topk(max(1, min(n, k))).values[-1]
+            filtered = p.masked_fill(p < threshold, 0)
+            output.append(filtered / filtered.sum().clamp_min(1e-30))
+        return torch.stack(output)
+    import triton
+
+    from mstar.engine.resources.sampler.kernels import _fused_filter_kernel
+    if current_platform.is_rocm():
+        from mstar.utils.flashinfer_rocm import import_flashinfer_rocm
+        flashinfer = import_flashinfer_rocm("sampling")
+    else:
+        import flashinfer
 
     vocab = probs.shape[1]
     k = torch.where(top_k > 0, top_k, vocab).to(torch.int32)
@@ -769,7 +404,7 @@ class GenerationHistory:
         self._pending_reset: set[int] = set()
         self.count = torch.zeros(capacity, dtype=torch.int32, device=device)
         self.tokens = torch.full((capacity, window), -1, dtype=torch.long, device=device)
-        self._stager = PinnedStager(torch.long, numel=capacity)
+        self._stager = None if device.type == "cpu" else PinnedStager(torch.long, numel=capacity)
         # graph path, allocated by ``allocate_step_buffers``
         self.step_count: torch.Tensor | None = None
         self.step_tokens: torch.Tensor | None = None
@@ -825,7 +460,11 @@ class GenerationHistory:
         caller advances and hands back to ``write``."""
         self._sync_device()
         rows = torch.empty(len(request_ids), dtype=torch.long, device=self.device)
-        self._stager.copy_(rows, self._slots(request_ids, len(request_ids)))
+        slots = self._slots(request_ids, len(request_ids))
+        if self._stager is None:
+            rows.copy_(torch.tensor(slots, dtype=torch.long))
+        else:
+            self._stager.copy_(rows, slots)
         return rows, self.tokens.index_select(0, rows), self.count.index_select(0, rows)
 
     def write(self, rows: torch.Tensor, tokens: torch.Tensor, count: torch.Tensor) -> None:
@@ -869,22 +508,6 @@ class GenerationHistory:
 
 
 # Temperatures below this are greedy: past it 1/T overflows fp32 and the paths disagree.
-GREEDY_TEMPERATURE = 1e-5
-
-
-def canonical_sampling_values(
-    temperature, top_k, top_p, min_p,
-) -> tuple[float, int, float, float]:
-    """The one meaning of each knob, applied before either sampler reads it.
-
-    ``temperature`` below ``GREEDY_TEMPERATURE`` is greedy (0). A greedy row
-    ignores top-k / top-p / min-p, so they are written as off.
-    """
-    if temperature < GREEDY_TEMPERATURE:
-        return 0.0, 0, 1.0, 0.0
-    # any top_k past the vocab is off; past int32 it would not even fit the buffers
-    top_k = int(top_k) if int(top_k) < 2**31 else 0
-    return float(temperature), top_k, float(top_p), float(min_p)
 
 
 @dataclass
@@ -1052,7 +675,7 @@ class Sampler(BaseSampler):
     def sample(
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = True, apply_filters: bool = True,
-        kept_rids: "frozenset | None" = None, **kwargs
+        kept_rids: "frozenset | None" = None, rand_offset: torch.Tensor | None = None, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -1083,10 +706,12 @@ class Sampler(BaseSampler):
             if any(c.min_p > 0 for c in configs) else None
         )
         seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
-        rand_offset = torch.tensor(
-            [self._step_offset.get(rid, 0) for rid in request_ids],
-            device=logits.device, dtype=torch.long,
-        )
+        host_offsets = rand_offset is None
+        if host_offsets:
+            rand_offset = torch.tensor(
+                [self._step_offset.get(rid, 0) for rid in request_ids],
+                device=logits.device, dtype=torch.long,
+            )
 
         any_rep_pen = apply_penalty and any(p != 1.0 for p in penalties)
         any_greedy = any(c.temperature == 0 for c in configs)
@@ -1134,40 +759,45 @@ class Sampler(BaseSampler):
         #       generation this is cheap.
         tokens = self._broadcast_tokens(tokens)
 
+        self.complete_draw(
+            request_ids, tokens, kept_rids=kept_rids, history=history, rows=rows,
+            track_seen=any_rep_pen,
+            offset_stride=_rng_offset_stride(logits.device.type, logits.shape[-1]) if host_offsets else None,
+        )
+        return tokens
+
+    def complete_draw(
+        self, request_ids, tokens, *, kept_rids=None, history=None, rows=None,
+        track_seen=False, offset_stride=None,
+    ) -> None:
+        """Account for one draw at its owner's completion boundary.
+
+        Eager calls this per draw; an external realization calls it at resource
+        commit. Captured draws keep their existing in-graph device updates.
+        """
         if history is not None:
             advance_history(history, tokens)
             new_tokens, count = history.tokens, history.count
             if kept_rids is not None:
-                # only the kept rows' draws count
                 sel = torch.tensor([i for i, rid in enumerate(request_ids) if rid in kept_rids],
                                    dtype=torch.long, device=rows.device)
                 rows, count = rows.index_select(0, sel), count.index_select(0, sel)
                 new_tokens = None if new_tokens is None else new_tokens.index_select(0, sel)
             self.history.write(rows, new_tokens, count)
-
-        if any_rep_pen:
+        if track_seen:
             for i, rid in enumerate(request_ids):
                 if kept_rids is None or rid in kept_rids:
                     self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
-
-        # FlashInfer consumes one offset unit per sampled row. The XPU kernel
-        # consumes one Philox region per logit in its row, so advancing by one
-        # would make consecutive decode steps reuse overlapping RNG regions.
-        offset_stride = _rng_offset_stride(
-            logits.device.type, logits.shape[-1],
-        )
-        for rid in request_ids:
-            if kept_rids is not None and rid not in kept_rids:
-                continue
-            self._step_offset[rid] = (
-                self._step_offset.get(rid, 0) + offset_stride
-            )
-
-        return tokens
+        if offset_stride is not None:
+            for rid in request_ids:
+                if kept_rids is None or rid in kept_rids:
+                    self._step_offset[rid] = self._step_offset.get(rid, 0) + offset_stride
 
     def _stage(self, rows: list[list[float]]) -> torch.Tensor:
         """Per-request settings ``[len(rows), B]`` on the device in one pinned H2D
         (float32 holds every int a setting can take exactly)."""
+        if self.device.type == "cpu":
+            return torch.tensor(rows, dtype=torch.float32)
         values = np.asarray(rows, dtype=np.float32)
         if self._settings_stager is None:
             self._settings_stager = PinnedStager(torch.float32, numel=values.size)
@@ -1207,6 +837,36 @@ class Sampler(BaseSampler):
         return FilterOrder(top_p_first=dev[0] != 0, min_keep=dev[1].to(torch.int32))
 
 
+def _flashinfer_sampling(name: str):
+    def factory():
+        import flashinfer
+
+        return getattr(flashinfer.sampling, name)
+    return factory
+
+
+def _rocm_sampling(name: str):
+    def factory():
+        from mstar.engine.resources.sampler.rocm import sampling_from_probs
+
+        return sampling_from_probs(name)
+    return factory
+
+
+# FlashInfer's rejection samplers, reading one device seed/offset per row.
+# Every platform but ROCm keeps upstream FlashInfer, as before this dispatch.
+_top_p_sampling_from_probs = PlatformDispatch(
+    "top_p_sampling_from_probs",
+    rocm=_rocm_sampling("top_p_sampling_from_probs"),
+    default=_flashinfer_sampling("top_p_sampling_from_probs"),
+)
+_top_k_top_p_sampling_from_probs = PlatformDispatch(
+    "top_k_top_p_sampling_from_probs",
+    rocm=_rocm_sampling("top_k_top_p_sampling_from_probs"),
+    default=_flashinfer_sampling("top_k_top_p_sampling_from_probs"),
+)
+
+
 def _sample_cuda(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -1223,7 +883,6 @@ def _sample_cuda(
     order: FilterOrder | None = None,
 ) -> torch.Tensor:
     """Sample normalized CUDA inputs with FlashInfer."""
-    import flashinfer
 
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
     # (reads probs) to the same device/stream so the write-before-read is
@@ -1248,7 +907,7 @@ def _sample_cuda(
             return _filter_floor_and_draw(probs, top_k, top_p, seed, rand_offset, history, order)
         if top_k_zero_count == logits.shape[0]:
             # top-k is off for every row
-            result = flashinfer.sampling.top_p_sampling_from_probs(
+            result = _top_p_sampling_from_probs(
                 probs, top_p,
                 deterministic=True,
                 seed=seed, offset=rand_offset,
@@ -1256,7 +915,7 @@ def _sample_cuda(
         else:
             # top_k 0 is off: FlashInfer reads it as k=0, so a mixed batch's 0 rows drew token 0
             top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-            result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            result = _top_k_top_p_sampling_from_probs(
                 probs, top_k, top_p,
                 deterministic=True,
                 seed=seed, offset=rand_offset,
@@ -1280,7 +939,11 @@ def _filter_floor_and_draw(
     order: FilterOrder | None,
 ) -> torch.Tensor:
     """Filter, apply the min-tokens floor, and draw; graph-safe."""
-    import flashinfer
+    if current_platform.is_rocm():
+        from mstar.utils.flashinfer_rocm import import_flashinfer_rocm
+        flashinfer = import_flashinfer_rocm("sampling")
+    else:
+        import flashinfer
 
     probs = filter_top_k_top_p(probs, top_k, top_p, order)
     if history is not None and history.stop_ids is not None:
@@ -1563,9 +1226,13 @@ def sample_accelerator_graphable_gpu(
                 min_p=min_p,
             )
     elif logits.device.type == "cuda":
-        import flashinfer
 
         with torch.cuda.device(logits.device):
+            if current_platform.is_rocm() and not apply_penalty and min_p is None and history is None and order is None:
+                from mstar.engine.resources.sampler.prep_topk import try_sample
+                fast = try_sample(logits, temperature, top_k, top_p, seed, offset)
+                if fast is not None:
+                    return fast
             probs = fused_temperature_softmax(
                 logits, temperature,
                 penalty=rep_penalty if apply_penalty else None,
@@ -1584,7 +1251,7 @@ def sample_accelerator_graphable_gpu(
             # Sampling is thus reproducible only within a fixed batch layout; under
             # continuous batching (shifting positions) a request's stream is not.
             # Measured in test/sampling_test/flashinfer_batch_test.py.
-            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            samples = _top_k_top_p_sampling_from_probs(
                 probs, top_k, top_p, deterministic=True,
                 seed=seed, offset=offset,
             )
@@ -2415,10 +2082,7 @@ class SamplerBuffers:
         self._sync_device_capacity()
         if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        with self._offset_reset_lock:
-            resets, self._pending_offset_reset = self._pending_offset_reset, set()
-        for slot in resets:
-            self.offset.master[slot:slot + 1].zero_()
+        self._reset_pending_offsets()
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         if not self.ingraph_scatter:
             # with it on, the captured sample gathers off the master itself
@@ -2500,6 +2164,34 @@ class SamplerBuffers:
             for rid in request_ids
         ]
         return torch.tensor(slots, dtype=torch.long, device=self.last_token.master.device)
+
+    def _reset_pending_offsets(self) -> None:
+        with self._offset_reset_lock:
+            resets, self._pending_offset_reset = self._pending_offset_reset, set()
+        for slot in resets:
+            self.offset.master[slot:slot + 1].zero_()
+
+
+    def offsets_for(self, request_ids: list[str]) -> torch.Tensor:
+        """Eager draws use the same device RNG state as captured draws."""
+        self._sync_device_capacity()
+        for rid in request_ids:
+            slot = self._rid_to_slot[rid]
+            if slot in self._pending_init:
+                self._init_slot(slot, rid)
+        self._reset_pending_offsets()
+        return self.offset.master.index_select(0, self._slots_of(request_ids))
+
+
+    def advance_offsets(self, request_ids, offsets, stride, *, kept_rids=None) -> None:
+        """Commit an eager draw without reading device counters onto the host."""
+        advanced = offsets + stride
+        if kept_rids is not None:
+            keep = self.keep_mask([rid in kept_rids for rid in request_ids])
+            if keep is not None:
+                advanced = torch.where(keep, advanced, offsets)
+        self.offset.master.index_copy_(0, self._slots_of(request_ids), advanced)
+
 
     def write_last_tokens(self, request_ids: list[str], tokens: torch.Tensor) -> None:
         """Eager-step write of ``tokens`` (``[len(request_ids)]``) to the

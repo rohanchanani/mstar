@@ -632,6 +632,19 @@ appears in no spec, so it receives no resources:
      - Usually nothing. Declare no spec that names the node, unless the node needs the
        row above.
 
+External sampling computation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A selected implementation may consume ``SamplingPlan`` and return
+``SamplingResult`` instead of calling the built-in device sampler. The existing
+``SamplerResource`` still owns request policy, RNG offsets, generation history
+and completion. Plans expose resolved policy, filter bypass and optional history;
+returned tokens do not advance state until resource commit. ``sampler.cpu`` is
+the shared CPU consumer; implementations may also fuse sampling into their own
+computation under the same policy. Ordinary eager draws and captured in-graph
+updates retain their existing completion boundaries, including multiple draws
+within one forward.
+
 Two samplers on one node
 ~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -147,3 +147,59 @@ def test_commit_keeps_only_selected_rows_and_ignores_padding(buffer_device, kept
         mask = res._sampler.get_token_mask(rid)._seen_token_mask
         assert bool(mask[token]) == kept
     assert res._cg_buffers.offset.master[0].item() == 0
+
+
+@pytest.mark.parametrize("draws_per_step", [1, 15])
+@pytest.mark.parametrize("ingraph_scatter,kept", [(False, None), (False, frozenset({KEPT})), (True, None)])
+def test_rng_offsets_follow_eager_and_capture_path_transitions(monkeypatch, draws_per_step, ingraph_scatter, kept):
+    """Real owners/buffers, with deterministic CPU draws replacing GPU kernels.
+
+    Fifteen draws covers a code-predictor forward. This is a state-protocol
+    test, not evidence of CUDA/HIP sampling or capture support.
+    """
+    from mstar.engine.resources.sampler import utils
+
+    observed = []
+
+    def draw(offset):
+        observed.append(offset.clone())
+        return offset.remainder(V).to(torch.long)
+
+    monkeypatch.setattr(utils, "sample_tokens", lambda *, rand_offset, **kwargs: draw(rand_offset))
+    monkeypatch.setattr(
+        utils, "sample_accelerator_graphable_gpu",
+        lambda logits, temperature, top_k, top_p, seed, offset, **kwargs: draw(offset),
+    )
+    res = SamplerResource(V, False, torch.device("cpu"))
+    res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=2, max_seq_len=1)
+    res._cg_buffers.ingraph_scatter = ingraph_scatter
+    for rid in (KEPT, DROPPED):
+        res.ingest_request(rid, SamplingReqConfig(temperature=1.0))
+
+    for step_index, captured in enumerate((False, True, False, True)):
+        step = SamplerStep(kept_rids=kept)
+        ctx = StepContext(
+            (KEPT, DROPPED), "decode", 0, False,
+            slot_lease=SlotLease(0, SimpleNamespace(bs=2)) if captured else None,
+        )
+        res.plan(step, ctx)
+        for _ in range(draws_per_step):
+            res.sample([KEPT, DROPPED], torch.zeros(2, V))
+        res.commit(step, ctx)
+        expected = (step_index + 1) * draws_per_step
+        assert [int(offset[0]) for offset in observed] == list(range(expected))
+        if step_index:
+            assert _offset(res, KEPT, True) == expected
+            assert _offset(res, DROPPED, True) == (expected if kept is None else 0)
+    assert [int(offset[0]) for offset in observed] == list(range(4 * draws_per_step))
+
+    # A recycled master row cannot inherit the departed request's stream,
+    # including when its first draw takes the eager fallback.
+    res.remove_request(KEPT)
+    res.ingest_request(KEPT, SamplingReqConfig(temperature=1.0))
+    step = SamplerStep()
+    ctx = StepContext((KEPT,), "decode", 0, False)
+    res.plan(step, ctx)
+    token = res.sample([KEPT], torch.zeros(1, V))
+    res.commit(step, ctx)
+    assert token.item() == 0 and _offset(res, KEPT, True) == 1
