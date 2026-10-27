@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 
 
@@ -45,10 +47,12 @@ class Platform:
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
 
-    def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
+    def inductor_overrides(
+        self, num_tokens: int | None = None, rows: int | None = None,
+    ) -> dict[str, object]:
         """``torch._inductor.config`` values to patch in while the engine
-        compiles a forward for ``num_tokens`` tokens, a capture bucket's count,
-        or ``None`` when the forward serves any count.
+        compiles a forward for ``num_tokens`` tokens in ``rows`` rows, a
+        capture bucket's counts, or ``None`` when the forward serves any count.
 
         Meant for inductor codegen settings on this stack (say, which GEMM
         backends to autotune at small sizes), not for picking kernels. Empty
@@ -62,6 +66,18 @@ class Platform:
         first device call, so a value the user exported wins.
         """
         return {}
+
+    def visible_devices_env(
+        self, devices: str | None, environ: Mapping[str, str],
+    ) -> dict[str, str]:
+        """Env vars that limit this process and its children to ``devices``
+        (``mstar serve --gpus``). With None, check the current env and keep it,
+        raising ValueError if it picks devices inconsistently.
+
+        Runs before the first device call, so like process_env_defaults it is
+        asked of the platform torch was built for.
+        """
+        return {} if devices is None else {"CUDA_VISIBLE_DEVICES": devices}
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
@@ -91,12 +107,61 @@ class RocmPlatform(Platform):
         # "gfx942:sramecc+:xnack-": what follows the colon are target features
         return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
 
-    def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
-        # none until one is measured to help on AMD GPUs
-        return {}
+    # captured buckets up to this many tokens autotune GEMMs over ATen (hipBLASLt) only
+    ATEN_GEMM_MAX_TOKENS = 32
+    # and one-token-per-row (decode) buckets up to this many rows
+    ATEN_GEMM_MAX_DECODE_ROWS = 128
+
+    def inductor_overrides(
+        self, num_tokens: int | None = None, rows: int | None = None,
+    ) -> dict[str, object]:
+        # At decode sizes inductor's autotuner can't reliably pick between its
+        # Triton GEMM templates and hipBLASLt on MI300X. Its timings (12-17 us)
+        # sit above the real kernel time in a graph (6-13 us) and move up to 30%
+        # between compiles, so different compiles pick different kernels. On
+        # orpheus a bad pick cost 10% of the decode step at concurrency 4.
+        # hipBLASLt alone was the same or better at 1, 4, 16 and 64. Decode
+        # buckets of 48-128 rows also lose with Triton: it fuses silu*mul into
+        # the down projection's template, 40% slower than hipBLASLt there (9B
+        # c=64: +7.7% tok/s on ATen). Packed prefill buckets keep the Triton
+        # templates, which win there.
+        if num_tokens is None:
+            return {}
+        decode = rows is not None and rows == num_tokens
+        limit = self.ATEN_GEMM_MAX_DECODE_ROWS if decode else self.ATEN_GEMM_MAX_TOKENS
+        if num_tokens > limit:
+            return {}
+        overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
+        from mstar.platforms.rocm_gemm import SKINNY_MAX_ROWS, skinny_gemm_passes
+
+        if num_tokens <= SKINNY_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
+            # 1-2 row linears on AITER's skinny GEMM
+            overrides["pre_grad_custom_pass"], overrides["post_grad_custom_post_pass"] = passes
+        return overrides
 
     def process_env_defaults(self) -> dict[str, str]:
-        # none until one is measured to help on AMD GPUs
+        return {
+            # MIOpen's split-K implicit-GEMM conv solvers are not deterministic. Turning
+            # them off costs about 1% and makes same-seed outputs repeat. The backward
+            # one runs transposed convs (LTX-2.5's vocoder upsamplers).
+            "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC": "0",
+            "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_BWD_GTC_XDLOPS_NHWC": "0",
+        }
+
+    def visible_devices_env(
+        self, devices: str | None, environ: Mapping[str, str],
+    ) -> dict[str, str]:
+        # HIP (and torch on ROCm) prefer HIP_VISIBLE_DEVICES over
+        # CUDA_VISIBLE_DEVICES, so set both or a stale value wins.
+        if devices is not None:
+            return {"CUDA_VISIBLE_DEVICES": devices, "HIP_VISIBLE_DEVICES": devices}
+        hip = environ.get("HIP_VISIBLE_DEVICES")
+        cuda = environ.get("CUDA_VISIBLE_DEVICES")
+        if hip is not None and cuda is not None and hip != cuda:
+            raise ValueError(
+                f"HIP_VISIBLE_DEVICES={hip!r} and CUDA_VISIBLE_DEVICES={cuda!r} "
+                "disagree and HIP uses the first. Unset one or pass --gpus"
+            )
         return {}
 
 

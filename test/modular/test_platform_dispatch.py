@@ -15,7 +15,7 @@ import torch._inductor.config as inductor_config
 from mstar import platforms
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
-from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
+from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform, rocm_gemm
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.platforms.dispatch import PlatformDispatch
 
@@ -147,7 +147,7 @@ class _SmallGemmsOnAten(RocmPlatform):
     def __init__(self):
         self.queries: list[int | None] = []
 
-    def inductor_overrides(self, num_tokens=None):
+    def inductor_overrides(self, num_tokens=None, rows=None):
         self.queries.append(num_tokens)
         if num_tokens is not None and num_tokens <= 32:
             return {"max_autotune_gemm_backends": "ATEN"}
@@ -158,10 +158,12 @@ def _read_gemm_backends(*args, **kwargs):
     return inductor_config.max_autotune_gemm_backends, args, kwargs
 
 
-@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform()], ids=repr)
-def test_no_overrides_returns_the_callable_itself(on_platform, platform):
+@pytest.mark.parametrize(
+    ("platform", "num_tokens"), [(CudaPlatform(), 16), (RocmPlatform(), 64)], ids=repr,
+)
+def test_no_overrides_returns_the_callable_itself(on_platform, platform, num_tokens):
     on_platform(platform)
-    assert with_inductor_overrides(_read_gemm_backends, 16) is _read_gemm_backends
+    assert with_inductor_overrides(_read_gemm_backends, num_tokens) is _read_gemm_backends
     assert with_inductor_overrides(_read_gemm_backends) is _read_gemm_backends
 
 
@@ -195,12 +197,14 @@ def test_overrides_are_undone_when_the_call_raises(on_platform):
 
 
 class _EverythingOnAten(_SmallGemmsOnAten):
-    def inductor_overrides(self, num_tokens=None):
+    def inductor_overrides(self, num_tokens=None, rows=None):
         self.queries.append(num_tokens)
         return {"max_autotune_gemm_backends": "ATEN"}
 
 
 class _Submodule:
+    execution_capabilities = None
+
     def forward(self, *args, **kwargs):
         return _read_gemm_backends(*args, **kwargs)
 
@@ -227,16 +231,17 @@ class _GraphRunner:
 
     def __init__(self):
         self._submodule = _Submodule()
+        self._program = self._submodule
+        self._compile_policy = None
         self._compiled_forwards = {}
 
 
 def _bucket(num_tokens: int):
     return SimpleNamespace(
-        config=SimpleNamespace(
-            compile=True, compile_mode=None, capture_forward_method="forward_batched",
-        ),
+        config=SimpleNamespace(compile=True, compile_mode=None, capture_forward_method="forward_batched"),
         config_idx=0,
         num_tokens=num_tokens,
+        bs=num_tokens,
     )
 
 
@@ -280,3 +285,25 @@ def test_compiled_submodule_forwards_take_overrides_for_any_token_count(
         assert platform.queries == [None, None]
     else:
         assert isinstance(mgmt.forward, functools.partial)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "rows", "aten_only"),
+    [
+        (1, 1, True), (32, 32, True), (32, 4, True), (33, None, False),
+        (64, 64, True), (128, 128, True), (129, 129, False),  # decode buckets
+        (64, 4, False), (128, 16, False), (1024, 16, False),  # packed prefill
+        (None, None, False),
+    ],
+)
+def test_rocm_keeps_small_and_decode_buckets_gemms_on_aten(monkeypatch, num_tokens, rows, aten_only):
+    """Small buckets and one-token-per-row buckets up to 128 rows autotune
+    GEMMs over hipBLASLt only. Bigger ones, packed prefills past 32 tokens,
+    and forwards compiled for any token count keep inductor's defaults."""
+    monkeypatch.setattr(rocm_gemm, "skinny_gemm_passes", lambda: None)
+    overrides = RocmPlatform().inductor_overrides(num_tokens, rows)
+    assert overrides == ({"max_autotune_gemm_backends": "ATEN"} if aten_only else {})
+
+
+def test_cuda_keeps_inductors_defaults():
+    assert all(CudaPlatform().inductor_overrides(n) == {} for n in (1, 32, 1024, None))

@@ -2,10 +2,11 @@
 
 ``current_platform`` says whether the process drives NVIDIA (CUDA), AMD
 (ROCm), Intel (XPU) or no accelerator, and the GPU's architecture. Code that
-branches on hardware asks it rather than reading ``torch.version.hip``, the
-device type, or a raw compute capability. Which kernel to run stays the
-choice of the resource that runs it; the platform only says what the
-hardware is.
+branches on the GPU vendor or architecture asks it rather than reading
+``torch.version.hip``, the ``cuda`` device type, or a raw compute capability.
+``device.type == "cuda"`` is still the way to ask "is this a GPU". Which
+kernel to run stays the choice of the resource that runs it; the platform
+only says what the hardware is.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ __all__ = [
     "RocmPlatform",
     "XpuPlatform",
     "apply_process_env_defaults",
+    "apply_visible_devices",
     "current_platform",
     "resolve_platform",
 ]
@@ -86,3 +88,11 @@ def apply_process_env_defaults() -> None:
     """
     for key, value in _built_for().process_env_defaults().items():
         os.environ.setdefault(key, value)
+
+
+def apply_visible_devices(devices: str | None) -> None:
+    """Limit this process and its children to ``devices`` (comma-separated
+    indices). With None, keep the env's choice after the platform checks it.
+    Call before the first device call, like apply_process_env_defaults.
+    """
+    os.environ.update(_built_for().visible_devices_env(devices, os.environ))
