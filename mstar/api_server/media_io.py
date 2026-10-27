@@ -484,19 +484,64 @@ def torchcodec_samples_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS,
     return samples
 
 
+def decode_ffmpeg_capped(path: str, sample_rate: int, max_seconds: float = MAX_AUDIO_SECONDS):
+    """Bounded mono FFmpeg decode using the available torchcodec or PyAV backend."""
+    from mstar.model.components.media_io import uses_torchcodec
+
+    if uses_torchcodec():
+        return decode_torchcodec_capped(path, sample_rate, max_seconds)
+    return _decode_pyav_capped(path, sample_rate, max_seconds)
+
+
+def _decode_pyav_capped(path: str, sample_rate: int, max_seconds: float):
+    """Same PyAV resampling as the portable decoder, with upstream refusal rules.
+
+    Count actual output samples and elapsed playback from the stream start.
+    Check before retaining each frame; never trust the declared duration and
+    never truncate an oversized stream into a valid request.
+    """
+    import av
+    import torch
+
+    check_resample_rate(sample_rate, sample_rate)
+    parts, count = [], 0
+    with av.open(path) as container:
+        if not container.streams.audio:
+            raise ValueError("no audio stream")
+        stream = container.streams.audio[0]
+        start = max(0.0, float(stream.start_time * stream.time_base)) if stream.start_time is not None else 0.0
+        resampler = av.AudioResampler(format="fltp", layout="mono", rate=sample_rate)
+
+        def retain(frame):
+            nonlocal count
+            count += frame.samples
+            end = (float(frame.pts * frame.time_base) if frame.pts is not None else start) + frame.samples / sample_rate
+            if count > max_seconds * sample_rate or end - start > max_seconds:
+                raise AudioTooLongError(max_seconds)
+            parts.append(frame.to_ndarray()[0])
+
+        for frame in container.decode(stream):
+            for out in resampler.resample(frame):
+                retain(out)
+        for out in resampler.resample(None):
+            retain(out)
+    audio = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+    return torch.from_numpy(audio)
+
+
 def decode_audio(path: str, sample_rate: int = 16000, max_seconds: float = MAX_AUDIO_SECONDS):
     """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``,
     refused with :class:`AudioTooLongError` past ``max_seconds``.
 
     libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
-    then torchcodec for the rest (m4a, webm, ...).
+    then FFmpeg (torchcodec or PyAV) for the rest (m4a, webm, ...).
     """
     try:
         audio, sr = read_soundfile_capped(path, max_seconds)
     except AudioRefusedError:
         raise
     except Exception:  # noqa: BLE001 — not a libsndfile container
-        return decode_torchcodec_capped(path, sample_rate, max_seconds).numpy().astype(np.float32)
+        return decode_ffmpeg_capped(path, sample_rate, max_seconds).numpy().astype(np.float32)
     check_resample_rate(sr, sample_rate)
     if sr != sample_rate:
         try:

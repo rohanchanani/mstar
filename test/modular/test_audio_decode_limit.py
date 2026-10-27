@@ -129,6 +129,15 @@ def _use_soundfile(monkeypatch, fake):
     return fake
 
 
+@pytest.fixture(autouse=True)
+def torchcodec_backend(monkeypatch):
+    # These upstream cases explicitly supply fake torchcodec decoders; backend
+    # availability/probing is covered by the portable-decoder tests separately.
+    from mstar.model.components import media_io as portable
+
+    monkeypatch.setattr(portable, "uses_torchcodec", lambda: True)
+
+
 @pytest.fixture
 def clip(tmp_path):
     path = tmp_path / "clip.wav"
