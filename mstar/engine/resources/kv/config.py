@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from mstar.engine.resources.kv.encoding import KVEncoding, plain_kv_dtype
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
@@ -147,6 +148,31 @@ class PagedKVConfig(KVConfig):
         ):
             if value is not None:
                 setattr(self, name, value)
+
+
+@dataclass(kw_only=True)
+class ResolvedSequenceConfig(PagedKVConfig):
+    """Local storage geometry chosen by resource binding, already partitioned.
+
+    A contiguous sequence uses one full-capacity block. The existing arena
+    still owns block allocation; ``dense`` additionally requires committed,
+    bounded append steps and initializes newly assigned blocks before use.
+    """
+
+    encoding: KVEncoding
+    # Omitted consumer requests retain the binding's original storage default.
+    # This is not a second allocation dtype: ``encoding`` alone chooses storage.
+    inherited_encoding: KVEncoding
+    dense: bool = False
+    partition: str = "replicated"
+
+    @property
+    def page_bytes(self) -> int:
+        """Payload per resolved page; a dense page is one full-capacity block."""
+        import torch
+
+        element_bytes = torch.empty((), dtype=plain_kv_dtype(self.encoding)).element_size()
+        return self.num_layers * 2 * self.page_size * self.num_kv_heads * self.head_dim * element_bytes
 
 
 @dataclass(frozen=True)

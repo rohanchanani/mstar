@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ResourceViewConflict(ValueError):
+    """The requested views have no supported common physical representation."""
+
+
 @dataclass(frozen=True)
 class CombinedSplit:
     """A combined walk run on two kernels: decode for one-token rows, prefill
