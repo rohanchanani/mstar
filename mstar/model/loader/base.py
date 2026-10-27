@@ -97,6 +97,32 @@ def _apply_stacked(
     return name, None
 
 
+@dataclass(frozen=True)
+class RoutedWeight:
+    """Checkpoint value after model routing, before any physical loader."""
+    name: str
+    component: str | int | None
+    value: torch.Tensor
+
+
+def iter_routed_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    stacked_params: list[StackedParamRule] | None = None,
+    name_remapper: Callable[[str], str | None] | None = None,
+    skip_predicate: Callable[[str], bool] | None = None,
+) -> Iterable[RoutedWeight]:
+    stacked = stacked_params or []
+    for name, tensor in weights:
+        if skip_predicate is not None and skip_predicate(name):
+            continue
+        if name_remapper is not None:
+            name = name_remapper(name)
+            if name is None:
+                continue
+        target, component = _apply_stacked(name, stacked)
+        yield RoutedWeight(target, component, tensor)
+
+
 def load_weights_into(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
@@ -122,22 +148,13 @@ def load_weights_into(
 
     Returns: set of parameter paths that received a tensor.
     """
-    stacked = stacked_params or []
     params_dict = dict(module.named_parameters())
     loaded: set[str] = set()
     dropped: list[str] = []
     num_dropped = 0
 
-    for name, tensor in weights:
-        if skip_predicate is not None and skip_predicate(name):
-            continue
-        if name_remapper is not None:
-            mapped = name_remapper(name)
-            if mapped is None:
-                continue
-            name = mapped
-
-        target, shard_id = _apply_stacked(name, stacked)
+    for routed in iter_routed_weights(weights, stacked_params, name_remapper, skip_predicate):
+        target = routed.name
         if target not in params_dict:
             # Not an error: the checkpoint may carry extra keys (lm_head
             # ties, kv-scale, etc.). Caller can verify completeness via
@@ -147,7 +164,7 @@ def load_weights_into(
                 dropped.append(target)
             continue
 
-        _dispatch_loader(params_dict[target], tensor, shard_id)
+        _dispatch_loader(params_dict[target], routed.value, routed.component)
         loaded.add(target)
 
     if num_dropped:
