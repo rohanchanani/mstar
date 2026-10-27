@@ -17,6 +17,7 @@ from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
+    CapturePool,
     PiecewiseAcceleratorGraphRunner,
     autocast_scope,
     fail_if_graphs_required,
@@ -73,6 +74,7 @@ from mstar.utils.profiler import (
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.tensor_forward import TensorForwardRunner
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,11 @@ _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 # stops, and it was a quarter of the gpu thread's host time at batch 32.
 _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
+
+
+def _bound_execution(submodule):
+    caps = getattr(submodule, "execution_capabilities", None)
+    return caps is not None and caps.fixed_option is None
 
 
 def checkpoint_identity(path: str | Path) -> bytes:
@@ -127,6 +134,7 @@ class SubmoduleManagement:
     forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
+    tensor_program: "TensorForwardRunner | None" = None
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
@@ -150,6 +158,10 @@ class SubmoduleManagement:
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
+
+    @property
+    def physical(self):
+        return self.submodule if self.tensor_program is None else self.tensor_program.program
 
     def __post_init__(self):
         # Two hazards want a second slot, both of them the host running ahead of
@@ -616,7 +628,12 @@ class Engine:
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
 
-            if getattr(submodule, "disable_torch_compile", False):
+            if submodule_mgmt.tensor_program is not None:
+                submodule_mgmt.tensor_program.compile_eager()
+                submodule_mgmt.forward = submodule_mgmt.tensor_program.forward
+                submodule_mgmt.forward_batched = submodule_mgmt.tensor_program.forward_batched
+                continue
+            if _bound_execution(submodule) or getattr(submodule, "disable_torch_compile", False):
                 logger.info("Engine: torch.compile disabled for %s (submodule opt-out)", node_name)
                 continue
 
@@ -642,16 +659,38 @@ class Engine:
 
     def _autocast_dtype_for(self, submodule: NodeSubmodule) -> torch.dtype | None:
         """This node's autocast dtype, or None for one that opted out."""
-        return None if submodule.disable_autocast else self._autocast_dtype
+        capabilities = getattr(submodule, "execution_capabilities", None)
+        if capabilities is not None and capabilities.fixed_option is not None:
+            return capabilities.fixed_option.runner.implementation.autocast_dtype
+        return None if _bound_execution(submodule) or submodule.disable_autocast else self._autocast_dtype
 
     def warmup(self) -> None:
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
+        bound_runners: dict[str, dict[str, TensorForwardRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
+            if _bound_execution(submodule):
+                capabilities = submodule.execution_capabilities
+                bound_runners[node_name] = {}
+                for option in capabilities.options:
+                    runner = option.runner
+                    if runner is not None:
+                        runner.configure(
+                            self._runner, joint_comm_group=submodule_mgmt.joint_comm_group,
+                            num_slots=submodule_mgmt.num_slots, batch_limits=capabilities.batch_limits,
+                            device_capability=self.device_capability, enable_nvtx=self._enable_nvtx,
+                        )
+                        bound_runners[node_name][option.name] = runner
+                continue
+            fixed_runner = submodule_mgmt.tensor_program
+            if fixed_runner is not None and not fixed_runner.implementation.capture.enabled:
+                continue
             ag_runners[node_name] = AcceleratorGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
+                program=None if fixed_runner is None else fixed_runner.program,
+                compile_policy=None if fixed_runner is None else fixed_runner.implementation.capture.compile,
                 resources=submodule_mgmt.resources,
                 step_runner=self._runner,
                 device=self._device,
@@ -661,6 +700,8 @@ class Engine:
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
             )
+            if fixed_runner is not None:
+                fixed_runner.graph_runner = ag_runners[node_name]
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt
             )
@@ -668,22 +709,27 @@ class Engine:
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
         # buffers an earlier node's graphs already recorded the address of.
-        for node_name in self._submodules:
-            ag_runners[node_name].prepare_for_capture()
+        for node_name, runner in ag_runners.items():
+            runner.prepare_for_capture()
             for runner in piecewise[node_name].values():
+                runner.prepare_for_capture()
+
+        for runners in bound_runners.values():
+            for runner in runners.values():
                 runner.prepare_for_capture()
 
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
-        plan = self._plan_captures(ag_runners, piecewise)
+        plan = self._plan_captures(ag_runners, piecewise, bound_runners)
 
-        for node_name, submodule_mgmt in self._submodules.items():
-            runner = ag_runners[node_name]
+        for node_name, runner in ag_runners.items():
+            submodule_mgmt = self._submodules[node_name]
             # the kernels a capture (and the compile inside it) picks are what
             # every replay runs, so it happens under the node's precision
             with self._capture_into(plan, node_name) as planned, \
                     fp32_precision_scope(submodule_mgmt.fp32_precision):
-                runner.warmup_and_capture(planned)
+                consumer = submodule_mgmt.tensor_program or runner
+                consumer.warmup_and_capture(planned)
             if plan is not None or runner.any_graphs:
                 submodule_mgmt.capture_runner = runner
             if runner.any_graphs:
@@ -699,6 +745,14 @@ class Engine:
                     if pw_runner.any_graphs:
                         captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
+        for node_name, runners in bound_runners.items():
+            for name, runner in runners.items():
+                if runner.graph_runner is None:
+                    runner.warmup_and_capture(None)
+                    continue
+                with self._capture_into(plan, (node_name, name)) as planned, \
+                        fp32_precision_scope(self._submodules[node_name].fp32_precision):
+                    runner.warmup_and_capture(planned)
         if plan is not None:
             torch.cuda.empty_cache()
             free = torch.cuda.mem_get_info(self._device)[0]
@@ -717,11 +771,19 @@ class Engine:
             for node_name, runners in piecewise.items()
             for label, runner in runners.items()
             for bs, tokens in runner.dropped_shapes
+        ] + [
+            f"{node_name} {name} {key}"
+            for node_name, runners in bound_runners.items()
+            for name, runner in runners.items() if runner.graph_runner is not None
+            for key in runner.graph_runner.dropped_buckets
         ])
 
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules()
+        for runners in bound_runners.values():
+            for runner in runners.values():
+                runner.compile_eager()
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
@@ -729,6 +791,7 @@ class Engine:
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]],
+        bound_runners: dict[str, dict[str, "TensorForwardRunner"]] | None = None,
     ) -> CapturePlan | None:
         """Size every bucket on the device, then plan which to capture.
 
@@ -738,19 +801,25 @@ class Engine:
         """
         if self._device is None or self._device.type != "cuda":
             return None
-        def planned(size: Callable[[Any], dict]) -> tuple[dict[str, dict], int, CapturePlan]:
+        bound_runners = bound_runners or {}
+
+        def planned(size: Callable[[Any], dict]) -> tuple[dict[CapturePool, dict], int, CapturePlan]:
             """A plan over what ``size`` says each runner's buckets cost."""
-            pools: dict[str, dict] = {}
+            pools: dict[CapturePool, dict] = {}
             for node_name, submodule_mgmt in self._submodules.items():
                 # sizing runs the forwards and captures, so under the node's precision too
                 with fp32_precision_scope(submodule_mgmt.fp32_precision):
-                    pools[node_name] = size(ag_runners[node_name])
+                    if node_name in ag_runners:
+                        pools[node_name] = size(ag_runners[node_name])
                     # one pool for all of a node's regions (see `_build_piecewise_runners`)
                     pools[f"{node_name} piecewise"] = {
                         (label, bucket): cost
-                        for label, runner in piecewise[node_name].items()
+                        for label, runner in piecewise.get(node_name, {}).items()
                         for bucket, cost in size(runner).items()
                     }
+                    for name, runner in bound_runners.get(node_name, {}).items():
+                        if runner.graph_runner is not None:
+                            pools[node_name, name] = size(runner.graph_runner)
             torch.cuda.empty_cache()
             free, total = torch.cuda.mem_get_info(self._device)
             reusable = None
@@ -792,7 +861,7 @@ class Engine:
         return plan
 
     @contextmanager
-    def _capture_into(self, plan: CapturePlan | None, pool: str) -> Iterator[set | None]:
+    def _capture_into(self, plan: CapturePlan | None, pool: CapturePool) -> Iterator[set | None]:
         """Yield what ``plan`` captures into ``pool``, then log what capturing it took."""
         if plan is None:
             yield None
@@ -2202,6 +2271,9 @@ class Engine:
         running back to back.
         """
         submodule_mgmt = self._submodules[node_name]
+        capabilities = getattr(submodule_mgmt.submodule, "execution_capabilities", None)
+        if capabilities is not None:
+            return capabilities.batch_limits.get(graph_walk)
         caps = [submodule_mgmt.submodule.max_batch_size(graph_walk)]
         if submodule_mgmt.capture_runner is not None:
             caps.append(

@@ -356,6 +356,7 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
     runner._dummy_rows = SimpleNamespace(ensure=ensure, reset=lambda rids, free=False: None)
     runner._dummy_engine_inputs = lambda rids, walk: SimpleNamespace(per_request_info={})
     runner._submodule = SimpleNamespace(declare_step=declare_step, preprocess=lambda **kwargs: {})
+    runner._program = runner._submodule
     runner._graph_backend = SimpleNamespace(set_device=lambda: None, synchronize=lambda: None)
     runner._step_runner = SimpleNamespace(
         admit=lambda step: kv.admit(step.get("kv"), step.ctx),

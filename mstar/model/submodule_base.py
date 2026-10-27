@@ -526,6 +526,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # would pay for nothing.
     reads_device_loopback: bool = False
 
+    # execution_result only interprets outputs. All resource effects are in the
+    # declared step; mapping neither adds effects nor reads/mutates resource state.
+    # This lets tensor execution commit before output collection, as native nodes do.
+    execution_result_is_output_only: bool = False
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs
@@ -538,6 +543,23 @@ class NodeSubmodule(torch.nn.Module, ABC):
         # embedder, scratch caches), bound once at load. Empty until then
         # and on engines that build none.
         self.node_resources: dict[str, Any] = {}
+        self.execution_capabilities = None
+        self.binding = None
+
+    def bind_execution(self, binding, capabilities) -> None:
+        self.binding = binding
+        self.execution_capabilities = capabilities
+
+    def logical_contract(self):
+        """Describe a bound program's logical input and result interface."""
+        raise NotImplementedError(f"{type(self).__name__} has no logical call description")
+
+    def execution_result(self, result, invocation):
+        """Adapt a program's result to node outputs and resource effects."""
+        from mstar.engine.execution import ExecutionResult
+        if isinstance(result, ExecutionResult):
+            return result
+        return ExecutionResult(BatchedModelOutput.coerce(result))
 
     def bind_node_resources(self, resources: dict[str, Any]) -> None:
         """Receive the engine-built resources for this submodule's node, and
@@ -601,6 +623,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return state
 
     def get_device(self):
+        if self.binding is not None:
+            return self.binding.device
         return next(self.parameters()).device
 
     @abstractmethod

@@ -2,7 +2,7 @@ import ctypes
 import logging
 import os
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, is_dataclass, replace
 from functools import cache, partial
 from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple
@@ -91,6 +91,8 @@ def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[s
 def autocast_scope(dtype: torch.dtype | None, device_type: str):
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
     submodule in its own dtype and shuts out any ambient autocast."""
+    if dtype is None and not torch.is_autocast_enabled(device_type):
+        return nullcontext()
     return torch.amp.autocast(
         device_type, enabled=dtype is not None, dtype=dtype or torch.bfloat16
     )
@@ -488,20 +490,23 @@ def _size_in_walk(
 _SEGMENT = 2 * 2**20
 
 
+CapturePool = str | tuple[str, str]
+
+
 class CapturePlan(NamedTuple):
     """Which buckets each graph pool on a device captures, chosen before any is."""
     # pool -> the buckets it captures
-    buckets: dict[str, set]
+    buckets: dict[CapturePool, set]
     # pool -> bytes it is predicted to hold
-    predicted: dict[str, int]
+    predicted: dict[CapturePool, int]
     # pool -> bytes its graphs hold outside the allocator
-    outside: dict[str, int]
+    outside: dict[CapturePool, int]
     # bytes the largest eager step on the device takes
     floor: int
 
 
 def plan_captures(
-    pools: Mapping[str, Mapping[Any, CaptureCost]], free: int, reusable: int | None = None,
+    pools: Mapping[CapturePool, Mapping[Any, CaptureCost]], free: int, reusable: int | None = None,
 ) -> CapturePlan:
     """The cheapest buckets across every pool on a device, added while the
     largest eager step still fits in ``free`` beside them.
@@ -529,7 +534,7 @@ def plan_captures(
     def reused(cost: CaptureCost) -> int:
         return min(unused.get(cost.executable, 0), bound, cost.slots * cost.outside)
 
-    def added(pool: str, cost: CaptureCost) -> int:
+    def added(pool: CapturePool, cost: CaptureCost) -> int:
         # whole segments: the costliest graph's scratch may have no room left for a small tensor
         kept = -(-cost.kept // _SEGMENT) * _SEGMENT
         return cost.slots * kept + max(cost.graph - cost.kept - scratch[pool], 0)
@@ -544,7 +549,11 @@ def plan_captures(
     ]
     while left:
         # a tie goes to the pool named first, which leads with its node, then to capture order
-        best = min(left, key=lambda candidate: (on_device(candidate), *candidate[:2]))
+        best = min(left, key=lambda candidate: (
+            on_device(candidate),
+            (candidate[0],) if isinstance(candidate[0], str) else candidate[0],
+            candidate[1],
+        ))
         pool, _, bucket, cost = best
         if on_device(best) > room:
             break
@@ -666,13 +675,21 @@ class AcceleratorGraphRunner:
         num_slots: int,
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
+        batch_limits: Mapping[str, int] | None = None,
+        program: torch.nn.Module | None = None,
+        execution_name: str | None = None,
+        compile_policy=None,
     ):
         self._submodule_name = submodule_name
         self._submodule = submodule
+        self._program = submodule if program is None else program
+        self._execution_name = execution_name
+        self._compile_policy = compile_policy
+        self._batch_limits = dict(batch_limits or {})
         self._comm_group = joint_comm_group
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
-            submodule.get_accelerator_graph_configs(
+            self._program.get_accelerator_graph_configs(
                 device, joint_comm_group.world_size
             )
         )
@@ -719,7 +736,8 @@ class AcceleratorGraphRunner:
         # padding rows, keyed "<config_idx>_slot<slot>". Sized by the largest
         # bucket (captures run largest-first); smaller buckets take a prefix.
         self._dummy_rows = DummyRowPool(
-            prefix=submodule_name, step_runner=step_runner, resources=resources,
+            prefix=submodule_name if execution_name is None else f"{submodule_name}:{execution_name}",
+            step_runner=step_runner, resources=resources,
         )
 
         # Sum of bytes that WOULD have been allocated by per-capture clones
@@ -748,7 +766,14 @@ class AcceleratorGraphRunner:
         return bool(self._buckets)
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
-        return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+        sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+        if not all(walk in self._batch_limits for walk in config.replay_graph_walks):
+            return sizes
+        limit = max(self._batch_limits[walk] for walk in config.replay_graph_walks)
+        # Keep the ceiling bucket for padding (three rows still need four).
+        # Larger shapes cannot serve an admitted invocation on this binding.
+        ceiling = min((size for size in sizes if size >= limit), default=max(sizes))
+        return [size for size in sizes if size <= ceiling]
 
     # ── Capture ─────────────────────────────────────────────────────────
 
@@ -762,6 +787,7 @@ class AcceleratorGraphRunner:
                         cg_key_info=config.additional_key_info,
                         bs=bs,
                         num_tokens=num_tokens,
+                        execution_name=self._execution_name,
                     )
                     for slot in range(self._num_slots):
                         specs.append(CGSlotSpec(
@@ -1126,7 +1152,7 @@ class AcceleratorGraphRunner:
                         f"capture admit failed for {spec.bucket}: {outcome.reason}"
                     )
                 self._step_runner.plan(step)
-            return self._submodule.preprocess(
+            return self._program.preprocess(
                 graph_walk=walk,
                 engine_inputs=engine_inputs,
                 inputs=dummy_inputs,
@@ -1201,15 +1227,23 @@ class AcceleratorGraphRunner:
         so each bucket compiles on its first call under the overrides for its
         own token count.
         """
-        forward = getattr(self._submodule, spec.config.capture_forward_method)
-        if not spec.config.compile:
+        forward = getattr(self._program, spec.config.capture_forward_method)
+        policy = self._compile_policy
+        if not spec.config.compile or (policy is not None and not policy.enabled):
             return forward
         if spec.config_idx not in self._compiled_forwards:
             self._compiled_forwards[spec.config_idx] = torch.compile(
-                forward, **compile_kwargs(spec.config.compile_mode),
+                forward, **(compile_kwargs(spec.config.compile_mode) if policy is None else {
+                    "mode": policy.mode, "fullgraph": policy.fullgraph, "dynamic": policy.dynamic,
+                }),
+            )
+        if policy is not None:
+            return policy.wrap(
+                self._compiled_forwards[spec.config_idx],
+                num_tokens=spec.num_tokens, batch_size=spec.bs,
             )
         return with_inductor_overrides(
-            self._compiled_forwards[spec.config_idx], spec.num_tokens,
+            self._compiled_forwards[spec.config_idx], spec.num_tokens, spec.bs,
         )
 
     def _dummy_engine_inputs(
@@ -1999,7 +2033,7 @@ class PiecewiseAcceleratorGraphRunner:
         if self._config.compile:
             fn = with_inductor_overrides(
                 torch.compile(fn, **compile_kwargs(self._config.compile_mode)),
-                shape.total_tokens,
+                shape.total_tokens, shape.bs,
             )
 
         def run_fn():
