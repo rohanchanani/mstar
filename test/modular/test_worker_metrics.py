@@ -104,7 +104,8 @@ def _engine(resources=(), sub=None, keyed=False) -> Engine:
     eng = Engine.__new__(Engine)
     eng._resources = {r.name: r for r in resources}
     eng._resource_nodes = {r.name: frozenset({NODE}) for r in resources}
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub or _Sub(), resources={})}
+    logical = sub or _Sub()
+    eng._submodules = {NODE: SimpleNamespace(submodule=logical, physical=logical, tensor_program=None, resources={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     eng._runner = StepRunner(eng._resources, node_resources={NODE: list(eng._resources)})
@@ -323,6 +324,10 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
 
     w = Worker.__new__(Worker)
     w.worker_id = "worker_0"
+    w._executors = []
+    w._stop_requested = False
+    w.runtime_extension = None
+    w._parallel_nodes = set()
     w.enable_nvtx = False
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
@@ -390,6 +395,27 @@ def test_with_metrics_off_the_run_loop_records_and_sends_nothing(monkeypatch):
         w.run()
     assert postprocessed == ["a"]
     assert sent == [] and _hist(metrics.snapshot(), "mstar_step_seconds") == {}
+
+
+def test_main_phase_timing_retains_samples_when_enabled(monkeypatch):
+    from collections import defaultdict
+    import mstar.utils.profiler as profiler
+    import mstar.worker.worker as worker_mod
+
+    w, _, postprocessed, _ = _looping_worker(
+        monkeypatch, schedule=[("a", 2), None], speculate={}, refuse=set(),
+    )
+    samples = defaultdict(list)
+    monkeypatch.setattr(profiler, "PHASE_PERIOD", 10000)
+    monkeypatch.setattr(profiler, "_PHASE_BUF", samples)
+    worker_mod.gc.callbacks = []
+    w._phase_period, w._phase_buf = 10000, samples
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert postprocessed == ["a"]
+    assert samples["worker.main.teardown"]
+    assert samples["worker.main.process_messages"]
+    assert samples["worker.main.step_done"]
 
 
 # ── prefix cache ─────────────────────────────────────────────────────────────
@@ -755,3 +781,25 @@ def test_worker_families_reach_metrics(tmp_path, monkeypatch):
     assert samples[("mstar_step_seconds_bucket", _labels(component=NODE, graph_walk=DECODE, le="0.005"))] == 1
     assert samples[("mstar_step_seconds_bucket", _labels(component=NODE, graph_walk=DECODE, le="0.003"))] == 0
     assert samples[("mstar_batch_size_sum", step)] == 4
+
+
+@pytest.mark.parametrize("timed", [False, True])
+@pytest.mark.parametrize("nvtx", [False, True])
+def test_worker_span_preserves_nested_cleanup_and_exceptions(monkeypatch, timed, nvtx):
+    from collections import defaultdict
+    import mstar.worker.worker as worker_mod
+
+    worker = Worker.__new__(Worker)
+    worker._phase_period = int(timed)
+    worker.enable_nvtx = nvtx
+    worker._phase_buf = defaultdict(list)
+    events = []
+    monkeypatch.setattr(worker_mod, "range_push", lambda name, **kw: events.append(name))
+    monkeypatch.setattr(worker_mod, "range_pop", lambda **kw: events.append("pop"))
+    with pytest.raises(ValueError, match="sentinel"):
+        with worker._span("outer", cpu="outer.cpu"):
+            with worker._span("inner", cpu="inner.cpu"):
+                raise ValueError("sentinel")
+    assert events == (["outer", "inner", "pop", "pop"] if nvtx else [])
+    assert set(worker._phase_buf) == ({"outer", "outer.cpu", "inner", "inner.cpu"} if timed else set())
+    assert all(len(samples) == 1 and samples[0] >= 0 for samples in worker._phase_buf.values())

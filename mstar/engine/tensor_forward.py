@@ -106,6 +106,11 @@ class TensorForwardRunner:
         self.program.requires_grad_(False)
         self.forward = self.program.forward
         self.forward_batched = getattr(self.program, "forward_batched", None)
+        # Bind fixed program hooks alongside its forward entry points.
+        self._prepare_rows = getattr(self.program, "prepare_rows", None)
+        self._can_batch = getattr(self.program, "can_batch", None)
+        self._filter_batched_output = getattr(self.program, "filter_batched_output", None)
+        self._unpack_packed_outputs = getattr(self.program, "unpack_packed_outputs", None)
         self.graph_runner = None
         self._configured = False
         self._warmed = False
@@ -163,7 +168,7 @@ class TensorForwardRunner:
             self.forward_batched = policy.compile(self.program.forward_batched)
 
     def can_batch(self, batch, inputs):
-        can_batch = getattr(self.program, "can_batch", None)
+        can_batch = self._can_batch
         return bool(can_batch(batch, inputs)) if can_batch is not None else self.forward_batched is not None
 
     def acquire(self, facts):
@@ -183,7 +188,7 @@ class TensorForwardRunner:
         if self.implementation.capture.required and not self._warmed:
             raise RuntimeError("required capture has not been warmed")
         workspace.original = invocation
-        prepare_rows = getattr(self.program, "prepare_rows", None)
+        prepare_rows = self._prepare_rows
         if prepare_rows is not None:
             from mstar.engine.accelerator_graph_runner import autocast_scope
             with torch.no_grad(), autocast_scope(
@@ -349,7 +354,7 @@ class TensorForwardRunner:
         rows = {name: value.clone() if isinstance(value, torch.Tensor) and value.ndim == 0 else value
                 for name, value in rows.items()}
         per_rid = {}
-        filter_output = getattr(self.program, "filter_batched_output", None)
+        filter_output = self._filter_batched_output
         for i, (rid, out_id) in enumerate(zip(request_ids, out_ids, strict=False)):
             values = {name: [tensor[i:i + 1]] for name, tensor in rows.items()
                       if isinstance(tensor, torch.Tensor) and tensor.ndim and i < tensor.shape[0]}
@@ -358,7 +363,7 @@ class TensorForwardRunner:
                 values = filter_output(invocation.engine_inputs.per_request_info.get(rid), values)
             if values:
                 per_rid[rid] = values
-        unpack = getattr(self.program, "unpack_packed_outputs", None)
+        unpack = self._unpack_packed_outputs
         if raw.packed_outputs and unpack is not None:
             unpacked = unpack(
                 static_output=raw.packed_outputs, request_ids=list(request_ids),

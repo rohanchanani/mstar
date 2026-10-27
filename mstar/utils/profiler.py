@@ -47,6 +47,21 @@ def phase_end(name: str, start: tuple[float, float] | None) -> None:
         _PHASE_BUF[name + ".cpu"].append(thread_time() - start[1])
 
 
+class _DisabledPhaseLaps:
+    """Stateless disabled timer, shared safely across worker threads."""
+
+    __slots__ = ()
+
+    def lap(self, stage: str) -> None:
+        pass
+
+    def skip(self) -> None:
+        pass
+
+
+_DISABLED_PHASE_LAPS = _DisabledPhaseLaps()
+
+
 class PhaseLaps:
     """Consecutive stage timings: each ``lap(stage)`` records the wall and CPU
     time since the previous lap (or construction) as ``prefix + stage`` and
@@ -55,6 +70,11 @@ class PhaseLaps:
     elsewhere."""
 
     __slots__ = ("_prefix", "_t", "_c")
+
+    def __new__(cls, prefix: str = ""):
+        if not PHASE_PERIOD:
+            return _DISABLED_PHASE_LAPS
+        return super().__new__(cls)
 
     def __init__(self, prefix: str = "") -> None:
         self._prefix = prefix

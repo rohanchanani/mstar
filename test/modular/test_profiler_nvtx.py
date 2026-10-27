@@ -38,3 +38,33 @@ def test_client_nvtx_is_only_enabled_on_cuda(monkeypatch, backend):
     )
     client = MStarClient(enable_nvtx=True)
     assert (client._nvtx is not None) == (backend == "cuda")
+
+
+def test_disabled_phase_laps_are_shared_without_recording(monkeypatch):
+    import mstar.utils.profiler as profiler
+
+    monkeypatch.setattr(profiler, "PHASE_PERIOD", 0)
+    monkeypatch.setattr(profiler, "_PHASE_BUF", {})
+    first, second = profiler.PhaseLaps("first."), profiler.PhaseLaps("second.")
+    assert first is second
+    first.skip()
+    second.lap("step")
+    assert profiler.phase_buffer() == {}
+
+
+def test_enabled_phase_laps_keep_independent_clocks(monkeypatch):
+    from collections import defaultdict
+    import mstar.utils.profiler as profiler
+
+    monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
+    monkeypatch.setattr(profiler, "_PHASE_BUF", defaultdict(list))
+    wall, cpu = iter([0., 2., 5., 9.]), iter([0., 1., 3., 6.])
+    monkeypatch.setattr(profiler, "perf_counter", lambda: next(wall))
+    monkeypatch.setattr(profiler, "thread_time", lambda: next(cpu))
+    first, second = profiler.PhaseLaps("first."), profiler.PhaseLaps("second.")
+    first.lap("step")
+    second.lap("step")
+    assert dict(profiler.phase_buffer()) == {
+        "first.step": [5.], "first.step.cpu": [3.],
+        "second.step": [7.], "second.step.cpu": [5.],
+    }

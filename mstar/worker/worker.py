@@ -9,7 +9,7 @@ import time as _time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import cached_property, partial
@@ -363,6 +363,9 @@ class _LazyPerRid:
 
     def values(self):
         return self._dict().values()
+
+
+_UNINSTRUMENTED_SPAN = nullcontext()
 
 
 class Worker:
@@ -2187,8 +2190,13 @@ class Worker:
             torch.accelerator.set_device_index(self.device)
         apply_dynamo_config()
 
-    @contextmanager
     def _span(self, name: str, cpu: str | None = None):
+        if not self._phase_period and not self.enable_nvtx:
+            return _UNINSTRUMENTED_SPAN
+        return self._instrumented_span(name, cpu=cpu)
+
+    @contextmanager
+    def _instrumented_span(self, name: str, cpu: str | None = None):
         """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
 
         ``cpu`` names a second sample: this thread's CPU time over the span.
@@ -4796,13 +4804,14 @@ class Worker:
                 spec_pending = None
                 _iter_start = _time.perf_counter() if phase_period else 0.0
                 _iter_cpu = _time.thread_time() if phase_period else 0.0
-                laps = PhaseLaps("worker.main.")
+                laps = PhaseLaps("worker.main.") if phase_period else None
                 # Everything below moves pages — the removes and drains directly,
                 # ``_process_messages`` through a follower's delta, the readiness
                 # scans through ``check_ready``'s reload — and none of it may run
                 # while N's admit is outstanding. See ``_await_admit_settled``.
                 self._await_admit_settled(pending)
-                laps.skip()
+                if laps is not None:
+                    laps.skip()
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
@@ -4811,7 +4820,8 @@ class Worker:
                 # ever fail them.
                 self._fail_requests(self.scheduler.take_admit_errors())
                 self._apply_pending_drains(self._in_flight_rids)
-                laps.lap("teardown")
+                if laps is not None:
+                    laps.lap("teardown")
 
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()
@@ -4823,26 +4833,30 @@ class Worker:
                 self._apply_removes_whose_step_landed()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
-                laps.lap("process_messages")
+                if laps is not None:
+                    laps.lap("process_messages")
 
                 if self.enable_nvtx:
                     range_push("worker.check_ready_tensors", synchronize=False)
                 self._check_ready_tensors()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
-                laps.lap("check_ready_tensors")
+                if laps is not None:
+                    laps.lap("check_ready_tensors")
 
                 if self.enable_nvtx:
                     range_push("worker.poll_stream_buffers", synchronize=False)
                 self._poll_stream_buffers()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
-                laps.lap("poll_stream_buffers")
+                if laps is not None:
+                    laps.lap("poll_stream_buffers")
 
                 # Reads only: whether a rank sends this changes nothing it runs.
                 if metrics is not None:
                     metrics.maybe_report()
-                    laps.lap("metrics")
+                    if laps is not None:
+                        laps.lap("metrics")
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
@@ -4852,10 +4866,12 @@ class Worker:
                     pending, consecutive_spec_steps, fair,
                 )
                 # inclusive of `speculate` and `worker.schedule_yield_away`
-                laps.lap("build_speculation")
+                if laps is not None:
+                    laps.lap("build_speculation")
                 if speculation is not None:
                     _arm_speculation(speculation)
-                    laps.lap("arm_speculation")
+                    if laps is not None:
+                        laps.lap("arm_speculation")
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
@@ -4887,11 +4903,13 @@ class Worker:
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
 
-                    laps.skip()
+                    if laps is not None:
+                        laps.skip()
                     # set node._in_flight to false, since
                     # the node has just completed
                     self._clear_in_flight_flag(pending.batch)
-                    laps.lap("clear_in_flight")
+                    if laps is not None:
+                        laps.lap("clear_in_flight")
 
                     def _maybe_clear_spec():
                         nonlocal speculation
@@ -4967,10 +4985,12 @@ class Worker:
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
-                        laps.lap("failure_checks")
+                        if laps is not None:
+                            laps.lap("failure_checks")
                         if not speculation.is_yield_away:
                             self._thread_outputs_to_speculative(speculation, outputs)
-                            laps.lap("thread_outputs")
+                            if laps is not None:
+                                laps.lap("thread_outputs")
                         # The one settle for a step that runs: marks the batch
                         # speculatively scheduled (so its nodes are not put back
                         # on the ready queue while it executes -- not the dropped
@@ -4983,7 +5003,8 @@ class Worker:
                             speculation, success=True,
                             dropped_rids=speculation.dropped,
                         )
-                        laps.lap("settle_speculation")
+                        if laps is not None:
+                            laps.lap("settle_speculation")
 
                         if spec_batch.request_to_worker_graph:
                             if self.enable_nvtx:
@@ -5043,7 +5064,8 @@ class Worker:
                     # failure since the output tensors aren't valid;
                     # ``_handle_admit_failure`` already rehabilitated the
                     # failed rids upstream.
-                    laps.skip()
+                    if laps is not None:
+                        laps.skip()
                     if pending.node_batch.admit_error is None:
                         self.scheduler.clear_batch_limit(
                             pending.node_name, pending.graph_walk,
@@ -5055,7 +5077,8 @@ class Worker:
                             cpu="worker.postprocess_batch.cpu",
                         ):
                             self._postprocess_batch(pending, outputs)
-                        laps.skip()
+                        if laps is not None:
+                            laps.skip()
                         if metrics is not None:
                             metrics.step_done(
                                 pending.node_name, pending.graph_walk,
@@ -5064,11 +5087,13 @@ class Worker:
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
-                    laps.lap("step_done")
+                    if laps is not None:
+                        laps.lap("step_done")
                     in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
-                    laps.lap("post_removes")
+                    if laps is not None:
+                        laps.lap("post_removes")
                     _set_pending(None)
                     if spec_pending is None and self.is_tp_follower:
                         # N is done and nothing runs. Rank 0 tore down what N held
@@ -5077,7 +5102,8 @@ class Worker:
                         # it takes that step.
                         self._apply_removes_whose_step_landed()
                         self._apply_pending_removes_safe_to_drop(set())
-                    laps.lap("set_pending")
+                    if laps is not None:
+                        laps.lap("set_pending")
 
                 if spec_pending is not None:
                     if speculation.is_yield_away:
