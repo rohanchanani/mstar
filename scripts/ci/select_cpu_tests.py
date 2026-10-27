@@ -25,6 +25,7 @@ CPU_TEST_PATHS = (
 NOT_CPU_CORE = {
     "test/ci": "the build job runs it with unittest, without PyTorch",
     "test/rust": "the rust-transport job runs it against the built mstar_rust extension",
+    "test/rocm": "requires ROCm hardware and its optional backend libraries",
     "test/integration": "needs a GPU and real weights; skips without the checkpoint",
     "test/pi05/batch_test.py": "a load-test script named like a test module; it has no tests",
 }
