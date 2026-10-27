@@ -197,6 +197,7 @@ class PreprocessWorker:
             enable_prof=enable_prof,
         )
 
+        self.output_wakeup = EventWakeup()
         self.thread = threading.Thread(
             target=_preprocess_loop,
             kwargs=dict(
@@ -210,6 +211,7 @@ class PreprocessWorker:
                 discard_tensor_queue=self.discard_tensor_queue,
                 stop_event=self.stop_event,
                 wakeup=self.wakeup,
+                output_wakeup=self.output_wakeup,
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
@@ -220,7 +222,11 @@ class PreprocessWorker:
                 enable_nvtx=enable_nvtx,
             )
         )
-        self.thread.start()
+        try:
+            self.thread.start()
+        except BaseException:
+            self.close_output_wakeup()
+            raise
 
     def report_preprocess_finish(self) -> None:
         """Put each request's preprocess-finish time on the profile queue
@@ -414,6 +420,13 @@ class PreprocessWorker:
         if self.thread.is_alive():
             self.thread.join()
 
+    def close_output_wakeup(self):
+        """After both the producer and API drain have stopped using this fd."""
+        wakeup = self.output_wakeup
+        if wakeup is not None:
+            os.close(wakeup.fd)
+            self.output_wakeup = None
+
 
 def warm_up_model(model) -> None:
     """Run the model's ``warmup_preprocess`` once; a failure is logged, not
@@ -473,6 +486,7 @@ class PreprocessWorkerThread:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
         wakeup: EventWakeup | None = None,
+        output_wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
     ):
@@ -535,7 +549,13 @@ class PreprocessWorkerThread:
         # sleeping and sweeping the queues. None keeps the sleep (tests built
         # with a bare communicator).
         self.wakeup = wakeup
+        self.output_wakeup = output_wakeup
         self.idle_wait_ms = 20
+
+    def _notify_api(self):
+        wakeup = getattr(self, "output_wakeup", None)
+        if wakeup is not None:
+            wakeup.signal()
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -707,6 +727,7 @@ class PreprocessWorkerThread:
             if self.enable_prof:
                 profile.inputs = self._summarize_inputs(input)
             self.profile_queue.put(profile)
+            self._notify_api()
 
     @staticmethod
     def _start_profile(input: PreprocessInput) -> DataWorkerProfile:
@@ -929,6 +950,7 @@ class PreprocessWorkerThread:
             self._queue_completed_output(request_id, sequence, chunks.pop())
         for chunk in chunks:
             self.out_queue.put(chunk)
+            self._notify_api()
         if abort:
             self._abort_failed_request(request_id)
 
@@ -1040,6 +1062,7 @@ class PreprocessWorkerThread:
                 ready.metadata["frame_index"] = state.frame_index
                 state.frame_index += ready.metadata["frame_count"]
             self.out_queue.put(ready)
+            self._notify_api()
             state.next_emit += 1
 
     def _discard_result_tensor(
@@ -1374,6 +1397,7 @@ class PreprocessWorkerThread:
                         if profile is not None:
                             profile.failed = True
                             self.profile_queue.put(profile)
+                            self._notify_api()
                         # A request whose media load or prompt processing fails
                         # never reaches the conductor, so nothing downstream
                         # would ever complete it; surface the failure as an

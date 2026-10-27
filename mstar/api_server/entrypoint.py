@@ -116,6 +116,7 @@ def _conductor_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    runtime_admission=None,
 ):
     """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
     turns on the conductor's status message (metrics on)."""
@@ -172,6 +173,7 @@ def _conductor_process_target(
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
         status_interval_s=status_interval_s,
+        runtime_admission=runtime_admission,
     )
     try:
         conductor.run()
@@ -678,6 +680,11 @@ class APIServer:
     # Result collection (background thread)
     # ----------------------------------------------------------
 
+    def _wake_message_thread(self) -> None:
+        wakeup = getattr(self.preprocess_worker, "output_wakeup", None)
+        if wakeup is not None:
+            wakeup.signal()
+
     def _prune_recently_completed(self) -> None:
         now = time.time()
         stale = []
@@ -741,6 +748,9 @@ class APIServer:
         Also watches the conductor process. Once it exits, every pending
         request is failed and the HTTP server is told to stop."""
         next_liveness_check = 0.0
+        output_wakeup = getattr(self.preprocess_worker, "output_wakeup", None)
+        if output_wakeup is not None:
+            self.communicator.register_event_for_poll(output_wakeup)
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -750,10 +760,6 @@ class APIServer:
                     self._fail_pending_for_dead_conductor(exited)
                     return
             try:
-                with self.request_lock:
-                    if len(self.recently_completed) > 0:
-                        self._prune_recently_completed()
-
                 for message in self.communicator.get_all_new_messages():
                     if not isinstance(message, APIServerMessage):
                         logger.warning("Unexpected message type: %s", type(message))
@@ -952,11 +958,28 @@ class APIServer:
                         )
                 if to_wake:
                     notify_many(to_wake.values())
+                # Final local output may be the last event before parking.
+                with self.request_lock:
+                    if self.recently_completed:
+                        self._prune_recently_completed()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-            time.sleep(0.001)
+            if output_wakeup is None:
+                # Constructor-free test facades have no notification fd.
+                time.sleep(0.001)
+            elif self.running:
+                deadline = next_liveness_check
+                with self.request_lock:
+                    if self.recently_completed:
+                        ttl_deadline = min(self.recently_completed.values()) + self._recently_completed_ttl
+                        ttl_remaining = ttl_deadline - time.time()
+                        deadline = min(deadline, time.monotonic() + max(0, ttl_remaining))
+                # Published queue items leave the fd readable across the
+                # empty-queue/poll boundary, so no wake can fall in that gap.
+                remaining = max(0, deadline - time.monotonic())
+                self.communicator.poll_for_messages(timeout_ms=max(0, int(remaining * 1000 + 0.999)))
 
     # ----------------------------------------------------------
     # Streaming helper
@@ -1069,6 +1092,7 @@ class APIServer:
                             req.chunks = []
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
+                            self._wake_message_thread()
                     # Profiling (incl. the optional file write) runs outside the
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
@@ -1228,6 +1252,7 @@ class APIServer:
         with self.request_lock:
             req = self.pending_requests.pop(key, None)
             self._retire(key)
+            self._wake_message_thread()
         if req is None:
             return []
         self._record_end(req, "success")
@@ -1292,7 +1317,9 @@ class APIServer:
             req = self.pending_requests.pop(key, None)
             self.recently_completed.pop(key, None)
             self._retire(key)
+            self._wake_message_thread()
         if req is not None:
+            req.notify()
             self._record_end(req, outcome)
         if not active:
             return
@@ -1309,7 +1336,9 @@ class APIServer:
             if finished:
                 self.pending_requests.pop(key)
                 self._retire(key)
+                self._wake_message_thread()
         if finished:
+            req.notify()
             self._record_end(req, "abort")
         else:
             self.abort_submission(key)
@@ -1321,8 +1350,14 @@ class APIServer:
     def cleanup(self) -> None:
         self.preprocess_worker.shutdown()
         self.running = False
-        if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
-            self._msg_thread.join(timeout=2)
+        wakeup = getattr(self.preprocess_worker, "output_wakeup", None)
+        if wakeup is not None:
+            wakeup.signal()
+        message_thread = getattr(self, "_msg_thread", None)
+        if message_thread is not None and message_thread.is_alive():
+            message_thread.join(timeout=2)
+        if wakeup is not None and (message_thread is None or not message_thread.is_alive()):
+            self.preprocess_worker.close_output_wakeup()
 
 
 def _resolve_warmup_path(path: str) -> str:
@@ -2071,6 +2106,10 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    from mstar.runtime_extensions import load_runtime_extension
+    runtime_extension = load_runtime_extension(config)
+    runtime_admission = runtime_extension.admission_context() if runtime_extension is not None else None
+
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
     # model instance too, so it sees the same Pi05Config (action_horizon, etc.)
@@ -2123,7 +2162,8 @@ def main(argv: list[str] | None = None):
             args.tcp_transfer_device
         ),
         # The API server drops these until enable_metrics(), after the warmups.
-        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None},
+        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None,
+                "runtime_admission": runtime_admission},
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)

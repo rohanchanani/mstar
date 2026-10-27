@@ -1391,7 +1391,9 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
-    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {"status_interval_s": 1.0}
+    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
+        "status_interval_s": 1.0, "runtime_admission": None,
+    }
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 
