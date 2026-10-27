@@ -9,6 +9,7 @@ from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
+from mstar.runtime_extensions import extension_selects_node
 
 # MAX_INPUTS in rust/src/graph/spec.rs: the Rust runtime keeps a node's
 # readiness in a u64 mask. Checked for both runtimes, since AUTO may pick either.
@@ -64,7 +65,7 @@ def check_placement(model: Model, config: Mapping[str, Any]) -> list[str]:
     node_groups = config["node_groups"]
     walk_graphs = model.get_graph_walk_graphs()
     return [
-        *_node_group_shapes(model, node_groups),
+        *_node_group_shapes(model, config),
         *_walk_partitions(model, walk_graphs),
         *_node_placement(walk_graphs, node_groups),
     ]
@@ -100,9 +101,12 @@ def _describe(wg: WorkerGraph) -> str:
     )
 
 
-def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
+def _node_group_shapes(model: Model, config: Mapping[str, Any]) -> Iterator[str]:
     sharding = model.get_default_sharding_config()
-    for i, group in enumerate(node_groups):
+    has_extension = config.get("runtime_extension") is not None
+    if has_extension:
+        extension_selects_node(config, "")  # validate selection before using it
+    for i, group in enumerate(config["node_groups"]):
         names, ranks = group["node_names"], group["ranks"]
         tp, sp = group.get("tp_size", 1), group.get("sp_size", 1)
         if len(ranks) % (tp * sp):
@@ -110,10 +114,14 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
                 f"node_groups[{i}] (nodes {names}) has {len(ranks)} ranks; not "
                 f"divisible by tp_size*sp_size ({tp}*{sp}={tp * sp})."
             )
+        # Native capability lists describe the reference physical program.
+        # Registry assembly checks support for independently selected programs.
+        native = [node for node in names
+                  if not has_extension or not extension_selects_node(config, node)]
         for size, axis, enabled in (
             (tp, "tp", sharding.tp_enabled_nodes), (sp, "sp", sharding.sp_enabled_nodes),
         ):
-            if size > 1 and any(node not in enabled for node in names):
+            if size > 1 and any(node not in enabled for node in native):
                 yield (
                     f"node_groups[{i}] has {axis}_size {size} and contains nodes not "
                     f"in {axis}_enabled_nodes {sorted(enabled)}: {names}"

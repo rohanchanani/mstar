@@ -142,6 +142,7 @@ def test_bound_deployment_uses_requested_groups_not_reference_capabilities(
     monkeypatch,
 ):
     from mstar.distributed.base import ShardingConfig
+    from mstar.validation.placement import check_placement
 
     monkeypatch.setattr(
         described_model,
@@ -153,22 +154,28 @@ def test_bound_deployment_uses_requested_groups_not_reference_capabilities(
         ),
     )
     config = {
-        "node_groups": [{"node_names": ["audio_encoder"], "ranks": [0, 1, 2, 3], "tp_size": 2, "sp_size": 2}],
+        "node_groups": [
+            {"node_names": ["audio_encoder"], "ranks": [0, 1, 2, 3], "tp_size": 2, "sp_size": 2},
+            {"node_names": ["decoder"], "ranks": [4]},
+        ],
         "runtime_extension": {"factory": "external:Runtime"},
         "sharding_config": {"shard_dim": {"activation": 0}},
     }
     path = tmp_path / "deployment.yaml"
     path.write_text(yaml.safe_dump(config))
     sharding = described_model.get_sharding_config(str(path))
-    assert sharding.tp_enabled_nodes == sharding.sp_enabled_nodes == {"audio_encoder"}
+    assert check_placement(described_model, config) == []
+    assert sharding.tp_enabled_nodes == {"decoder"}
+    assert sharding.sp_enabled_nodes == set()
     assert len(sharding.groups) == 1
     assert sharding.groups[0].tp_size == 4
     assert sharding.groups[0].nodes == {"audio_encoder"}
     assert sharding.shard_dim == {"activation": 0, "preserved_shard": 2, "encoder_states": None}
     del config["runtime_extension"]
     path.write_text(yaml.safe_dump(config))
-    with pytest.raises(ValueError, match="not in tp_enabled_nodes"):
-        described_model.get_sharding_config(str(path))
+    problems = check_placement(described_model, config)
+    assert any("not in tp_enabled_nodes" in p for p in problems)
+    assert any("not in sp_enabled_nodes" in p for p in problems)
 
 
 @pytest.mark.parametrize("walk,tp_size", [("prefill", 1), ("decode", 2)])
@@ -231,3 +238,51 @@ def test_engine_binding_preserves_hosted_walks_and_explicit_disabled_autocast(
         )
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize("selected", [None, ["audio_encoder"], ["decoder"]])
+def test_mixed_group_retains_native_support_checks(described_model, selected):
+    from mstar.validation.placement import check_placement
+    extension = {"factory": "external:Runtime"}
+    if selected is not None:
+        extension["nodes"] = selected
+    config = {"runtime_extension": extension, "node_groups": [{
+        "node_names": ["audio_encoder", "decoder"], "ranks": [0, 1], "tp_size": 2,
+    }]}
+    problems = check_placement(described_model, config)
+    assert bool(problems) == (selected == ["decoder"])
+    if problems:
+        assert all("not in tp_enabled_nodes" in p for p in problems)
+
+
+@pytest.mark.parametrize("mutation,fragment", [
+    ({"ranks": [0, 1, 2], "tp_size": 2}, "not divisible"),
+    ({"ranks": [0], "tp_size": 0}, "integer >= 1"),
+    ({"ranks": [-1]}, "integers >= 0"),
+    ({"node_names": ["audio_encoder"]}, "decoder"),
+])
+def test_registry_selection_keeps_structural_refusals(described_model, mutation, fragment):
+    from mstar.validation.placement import check_placement
+    config = {"runtime_extension": {"factory": "external:Runtime"}, "node_groups": [{
+        "node_names": ["audio_encoder", "decoder"], "ranks": [0], **mutation,
+    }]}
+    assert any(fragment in p for p in check_placement(described_model, config))
+
+
+def test_valid_placement_still_requires_a_matching_acceleration(described_model):
+    from mstar.distributed.communication import WorkerParallelGroups
+    from mstar.worker.engine_manager import EngineManager
+    from mstar.validation.placement import check_placement
+    from mstar_accelerators.registry import Registry
+
+    config = {"runtime_extension": {"factory": "external:Runtime"}, "node_groups": [{
+        "node_names": ["audio_encoder", "decoder"], "ranks": [0],
+    }]}
+    assert check_placement(described_model, config) == []
+    with pytest.raises(ValueError, match="no acceleration binds audio_encoder"):
+        EngineManager().load(
+            {"audio_encoder"}, torch.device("cpu"), config,
+            WorkerParallelGroups(num_workers=1, global_rank=0), None,
+            described_model, None, runtime_extension=Registry({}),
+            node_walks={("audio_encoder", "prefill")},
+        )
