@@ -479,6 +479,7 @@ def test_explicit_instance_failure_stops_the_deployment_without_waiting_for_deat
     with pytest.raises(BackendFatalError, match="decoder"):
         c.run()
     assert _failed(c)["r"].status == 503
+    assert _failed(c)["r"].error_message.startswith("internal error (error id ")
 
 
 
@@ -494,3 +495,4 @@ def test_instance_failure_during_startup_does_not_wait_for_setup(monkeypatch):
     with pytest.raises(BackendFatalError, match="setup collective failed"):
         c._wait_for_workers_ready()
     assert _failed(c)["waiting"].status == 503
+    assert _failed(c)["waiting"].error_message.startswith("internal error (error id ")

@@ -62,6 +62,7 @@ from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetada
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils import knobs
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
@@ -861,9 +862,12 @@ class Worker:
             )
         except Exception as err:
             # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
-            logger.exception("Worker %s: ingest of request %s failed", self.worker_id, body.request_id)
+            text, _ = client_error_text(
+                err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
+                log=logger,
+            )
             self._fail_requests(
-                {request_id: f"Error in worker: {type(err).__name__}: {err}"},
+                {request_id: f"Error in worker: {text}"},
                 status=400 if isinstance(err, UnsupportedInvocation) else 500,
             )
             self._process_unprocessed(body.request_id)
@@ -1586,9 +1590,13 @@ class Worker:
             self.scheduler.read_failed_rids.update(
                 f.request_id for f in failed_reads if f.request_id in self.request_state.per_request_info
             )
-            # reported once per request
+            # reported once per request; the tensor manager logged the read's
+            # error where it failed
             failed = {
-                f.request_id: f"Error in worker: input tensor read failed: {type(f.error).__name__}: {f.error}"
+                f.request_id: "Error in worker: input tensor read failed: " + client_error_text(
+                    f.error, f"Worker {self.worker_id}: input tensor read of request {f.request_id} failed",
+                    log=logger, traceback=False,
+                )[0]
                 for f in failed_reads
                 if f.request_id not in self.scheduler.failed_rids
             }
@@ -4385,8 +4393,9 @@ class Worker:
         # where the concurrent.futures machinery has already wrapped the
         # engine's traceback. Report the leaf exception to the client and keep
         # the full chain in the log.
-        err = f"{type(exc).__name__}: {exc}"
-        logger.exception("Worker %s error in main loop: %s", self.worker_id, err)
+        err, _ = client_error_text(
+            exc, f"Worker {self.worker_id} error in main loop", log=logger,
+        )
 
         failed_rids: set[int] = set(self._in_flight_rids)
         for stale in in_flight:
