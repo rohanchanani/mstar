@@ -713,13 +713,16 @@ class KVTransferManager:
         resource_key: str = "kv",
         needs_remote_transfer: bool = True,
     ):
+        self._page_size = kv_cache.page_size
+        self._num_layers = kv_cache.num_layers
+        if transfer_engine_info is None and not needs_remote_transfer:
+            self._kv_transfer_engine = LocalOnlyKVTransferEngine()
+            return
+
         from mstar.communication.tensors import (
             LocalTransferEngine,
             MooncakeTransferEngine,
         )
-
-        self._page_size = kv_cache.page_size
-        self._num_layers = kv_cache.num_layers
 
         if isinstance(
             transfer_engine_info.transfer_engine, MooncakeTransferEngine

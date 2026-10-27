@@ -272,7 +272,7 @@ def test_compiled_submodule_forwards_take_overrides_for_any_token_count(
     platform = on_platform(_EverythingOnAten() if overrides else CudaPlatform())
     engine = Engine(graph_runtime=None, device_capability=SimpleNamespace(is_available=True))
     engine._submodules = {
-        "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None),
+        "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None, tensor_program=None),
     }
     engine._item_encoders = set()
     engine._compile_submodules()

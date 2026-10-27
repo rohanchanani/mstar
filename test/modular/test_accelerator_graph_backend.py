@@ -295,3 +295,13 @@ def test_chatterbox_shape_graphs_keep_results_across_replays(graph_device):
     torch.testing.assert_close(first.cpu(), host_source * 2 + 1)
     torch.testing.assert_close(second.cpu(), (host_source + 10) * 3 + 1)
     torch.testing.assert_close(third.cpu(), (host_source + 20) * 2 + 1)
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
+@pytest.mark.parametrize("index", [None, 0])
+def test_set_device_preserves_unindexed_current_device(monkeypatch, device_type, index):
+    selected = []
+    monkeypatch.setattr(torch.accelerator, "set_device_index", selected.append)
+    device = torch.device(device_type, index)
+    get_accelerator_graph_backend(device).set_device()
+    assert selected == ([] if index is None else [device])

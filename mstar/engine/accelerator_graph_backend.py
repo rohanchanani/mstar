@@ -122,7 +122,9 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
         return bool(self._runtime.is_available())
 
     def set_device(self) -> None:
-        torch.accelerator.set_device_index(self.device)
+        # An unindexed device denotes the already selected current device.
+        if self.device.index is not None:
+            torch.accelerator.set_device_index(self.device)
 
     def synchronize(self) -> None:
         torch.accelerator.synchronize(self.device)
