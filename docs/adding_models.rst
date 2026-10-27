@@ -2220,3 +2220,14 @@ The fastest way to add a new model is to base it on the existing model that is c
 it. Use Orpheus for a streaming LLM with a codec, Whisper for encoder-decoder
 cross-attention, BAGEL for a unified understanding and generation model, and Qwen3-Omni
 for a full omni-modal model.
+
+RoPE table precision
+~~~~~~~~~~~~~~~~~~~~
+
+A model can declare ``PositionConfig.rope_table_dtype`` when its checkpoint
+requires a rounded sine/cosine table. The position resource constructs that table
+with FP32 arithmetic, rounds to the requested dtype, and stores FP32 values for
+the CUDA/ROCm kernel. This explicit requirement takes precedence over ROCm's
+default FP64-angle/FP32-table cache. The default cache falls back to on-the-fly
+angles for different per-call parameters; an explicit table rejects parameters
+it does not encode. XPU retains its own table-precision restrictions.
