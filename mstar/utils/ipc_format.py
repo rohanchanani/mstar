@@ -292,6 +292,7 @@ class FailRequests(MessageBody):
     step can fail several of them for different reasons.
     """
     errors: dict[str, str]
+    status: int = 500
 
 
 @dataclass

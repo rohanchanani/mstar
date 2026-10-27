@@ -71,6 +71,9 @@ class _State:
 
 
 class _Engine:
+    def execution_capabilities(self, node_name):
+        return None
+
     def __init__(self, max_bs):
         self.max_bs = max_bs  # an int for every walk, or walk -> int
 

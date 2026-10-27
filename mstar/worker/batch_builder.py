@@ -7,10 +7,13 @@ and which go back to their ready queues.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import combinations, islice
 from typing import TYPE_CHECKING, Any, NamedTuple
+
+from mstar.engine.execution import ExecutionCapabilities, InvocationFacts
 
 if TYPE_CHECKING:
     from mstar.worker.micro_scheduler import ScheduledBatch
@@ -38,8 +41,11 @@ class BatchBuildRequest:
     # The caller's own rows (a speculation merge's continuing ones) and their walk.
     pre_existing_batch_size: int = 0
     pre_existing_walk: str | None = None
+    pre_existing_rids: tuple[int, ...] = ()
     # `Engine.capture_group` for one rid of this (node, walk).
     capture_group: Callable[[int], Any] = lambda _: None
+    execution_capabilities: ExecutionCapabilities | None = None
+    resource_facts: Callable[[Sequence[int]], Mapping] = lambda _: {}
 
 
 class BatchBuildResult(NamedTuple):
@@ -77,6 +83,58 @@ def _merged(
         return fresh
     backlog.merge(fresh)
     return backlog
+
+
+class CapabilityChoice(NamedTuple):
+    request_ids: tuple[int, ...]
+    search_exhausted: bool = False
+
+
+def choose_capability_rows(
+    rids: Sequence[int], *, capabilities: ExecutionCapabilities,
+    graph_walk: str,
+    walk_of: Callable[[int], str], facts_for: Callable[[str, tuple[int, ...]], InvocationFacts],
+    pre_existing_batch_size: int = 0, pre_existing_walk: str | None = None,
+    possibilities: Callable[[InvocationFacts], Any] | None = None,
+) -> CapabilityChoice:
+    """Bounded FIFO-priority subset search, shared by proposal and refinement.
+
+    Uniform proposals use their actual walk; mixed proposals keep the combined
+    label and row composition. A failed composition does not exclude smaller
+    or nonprefix subsets. Exhausting this search leaves rows waiting.
+    """
+    rows = tuple(islice(rids, capabilities.candidate_window))
+    upper = min(len(rows), max(capabilities.batch_limits.values(), default=0) - pre_existing_batch_size)
+
+    def supported(proposed):
+        walks = {walk_of(rid) for rid in proposed}
+        if pre_existing_walk is not None:
+            walks.add(pre_existing_walk)
+        walk = next(iter(walks)) if len(walks) == 1 else graph_walk
+        limit = capabilities.batch_limits.get(walk)
+        if limit is None:
+            # The condition still decides support for a mixed invocation. A
+            # per-walk bound limits search without inventing a new walk limit.
+            limit = max((capabilities.batch_limits.get(w, 0) for w in walks), default=0)
+        return (
+            len(proposed) + pre_existing_batch_size <= limit
+            and bool((possibilities or capabilities.possibilities)(facts_for(walk, proposed)))
+        )
+
+    budget = 256
+    for size in range(upper, 1, -1):
+        for proposed in islice(combinations(rows, size), budget):
+            budget -= 1
+            if supported(proposed):
+                return CapabilityChoice(proposed)
+        if budget == 0:
+            break
+    # Keep ordinary singleton progress even if the combination budget ran out.
+    if upper >= 1:
+        for rid in rows:
+            if supported((rid,)):
+                return CapabilityChoice((rid,))
+    return CapabilityChoice((), budget == 0 or len(rids) > len(rows))
 
 
 class BaseBatchBuilder(ABC):
@@ -157,6 +215,61 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             batch, request.capture_group,
             exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
         )
+        if request.execution_capabilities is not None:
+            if request.pre_existing_batch_size:
+                # A speculation merge gathers fresh input edges itself. Park
+                # interpreted rows for the ordinary path that owns their holds.
+                exclude |= batch.prepared_rows.keys()
+            def facts_for(walk, rids):
+                lengths = (
+                    tuple(batch.prepared_rows[rid].inputs.input_seq_len for rid in rids)
+                    if not request.pre_existing_batch_size
+                    and all(rid in batch.prepared_rows for rid in rids) else None
+                )
+                return InvocationFacts(
+                    walk, len(rids) + request.pre_existing_batch_size, lengths,
+                    request.resource_facts((*request.pre_existing_rids, *rids))
+                    if len(request.pre_existing_rids) == request.pre_existing_batch_size else {},
+                    ((request.pre_existing_walk,) * request.pre_existing_batch_size
+                     + tuple(batch.walk_of(rid) for rid in rids))
+                    if not request.pre_existing_batch_size or request.pre_existing_walk is not None else None,
+                )
+
+            candidates = [rid for rid in batch.request_to_worker_graph if rid not in exclude]
+            choice = choose_capability_rows(
+                candidates,
+                capabilities=request.execution_capabilities,
+                graph_walk=request.graph_walk,
+                walk_of=batch.walk_of, facts_for=facts_for,
+                pre_existing_batch_size=request.pre_existing_batch_size,
+                pre_existing_walk=request.pre_existing_walk,
+            )
+            selected = choice.request_ids
+            if not selected:
+                exhausted = (
+                    choice.search_exhausted
+                    or len(candidates) >= request.execution_capabilities.candidate_window
+                )
+                if candidates and exhausted:
+                    # A bounded search failure is not an unsupported request.
+                    # Advance its window rather than retrying the same subset.
+                    rid = candidates[0]
+                    batch.request_to_worker_graph[rid] = batch.request_to_worker_graph.pop(rid)
+                    batch._by_walk = None
+                return BatchBuildResult(None, backlog=batch)
+            scheduled, remainder = batch.split_off_first(
+                None, exclude_rids=set(batch.request_to_worker_graph) - set(selected),
+            )
+            # Interpreted rows must stay with their holds. Fresh overflow may
+            # return to the ready queues, preserving the existing fairness rule.
+            give_back = {
+                rid for rid in remainder.request_to_worker_graph
+                if rid in fresh_rids and rid not in exclude and rid not in remainder.prepared_rows
+            } if had_backlog and remainder else set()
+            if give_back:
+                parked, returned = remainder.split_off_first(None, exclude_rids=give_back)
+                return BatchBuildResult(scheduled, parked, dict(returned.request_to_worker_graph))
+            return BatchBuildResult(scheduled, remainder)
         walk = _single_walk(batch, request)
         if walk is None:
             max_bs, left_out = _compose_walks(batch, exclude, request)

@@ -245,10 +245,10 @@ def test_one_request_that_raises_in_a_failure_batch_keeps_the_others_errors():
     c = _conductor([_fail_ab()], _drained_ab(), requests={"a": _request(), "b": _request()})
     remove_request = c._remove_request
 
-    def _raise_once_for_a(rid, request_data, failure_error=None):
+    def _raise_once_for_a(rid, request_data, failure_error=None, failure_status=500):
         if rid == "a" and failure_error == "worker failed a":
             raise RuntimeError("could not tear a down")
-        remove_request(rid, request_data, failure_error=failure_error)
+        remove_request(rid, request_data, failure_error=failure_error, failure_status=failure_status)
     c._remove_request = _raise_once_for_a
     _run(c)
     failed = [

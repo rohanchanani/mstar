@@ -215,6 +215,9 @@ class _Manager:
 
 
 class _Engine:
+    def execution_capabilities(self, node_name):
+        return None
+
     def __init__(
         self, max_bs=None, not_ready=frozenset(), unservable=frozenset(),
         groups=None, row_caps=None,

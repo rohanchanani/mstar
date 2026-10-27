@@ -14,6 +14,12 @@ clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
 streaming_buffers}, the engine's and tensor manager's per-request state, and
 WorkerProfileInfo.
 
+Interpreted rows parked in ScheduledBatch.prepared_rows are part of that
+backlog: clear_rid/discard_rid drops their input holds. KVManager's
+_admit_marked and _pending_initialization records are purged by
+_forget_reservations during request reset/removal, together with its preplan
+handle records.
+
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
 stays keyed by the wire string and is purged by clear_wire_rid.

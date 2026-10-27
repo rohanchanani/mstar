@@ -32,8 +32,10 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.all_reduce import flagged_on_any_rank
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.distributed.execution import InstanceFatalError
 from mstar.engine import apply_dynamo_config
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.execution import InvocationFacts, UnsupportedInvocation
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
 from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
@@ -68,6 +70,7 @@ from mstar.utils.ipc_format import (
     DrainRequest,
     FailRequests,
     InputSignals,
+    InstanceFailed,
     MessageSource,
     NewRequest,
     ReadsDone,
@@ -89,6 +92,7 @@ from mstar.utils.profiler import (
     range_pop,
     range_push,
 )
+from mstar.worker.batch_builder import choose_capability_rows
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -407,9 +411,13 @@ class Worker:
         tcp_transfer_device="",
         dist_init_method=None,
         status_interval_s: float | None = None,
+        runtime_extension=None,
     ):
         # before anything below builds a resource or a submodule that reads one
         knobs.configure((model_config or {}).get("knobs"))
+        self.runtime_extension = runtime_extension
+        self._stop_requested = False
+        self._executors = []
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
@@ -529,7 +537,8 @@ class Worker:
             combined_walk_of=model.combined_walk_of() if model is not None else None,
         )
 
-        self.engine_manager = EngineManager.build(
+        self.engine_manager = EngineManager()
+        self.engine_manager.load(
             node_names,
             device=device,
             model_config=model_config,
@@ -545,6 +554,8 @@ class Worker:
             enable_nvtx=self.enable_nvtx,
             enable_prof=self.enable_prof,
             device_capability=self.device_capability,
+            runtime_extension=runtime_extension,
+            node_walks=my_walks,
         )
 
         self.request_state = RequestStateManager(
@@ -851,7 +862,10 @@ class Worker:
         except Exception as err:
             # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
             logger.exception("Worker %s: ingest of request %s failed", self.worker_id, body.request_id)
-            self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
+            self._fail_requests(
+                {request_id: f"Error in worker: {type(err).__name__}: {err}"},
+                status=400 if isinstance(err, UnsupportedInvocation) else 500,
+            )
             self._process_unprocessed(body.request_id)
             return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
@@ -1734,9 +1748,15 @@ class Worker:
         # would otherwise fail every other request in the step -- 64 duplex
         # sessions for one bad chunk. Take out just that rid and report it, so
         # the failure is attributed and loud.
+        fresh_rids = batch.request_to_worker_graph.keys() - batch.prepared_rows.keys()
+        edges = (
+            batch.input_edges.select_rids(fresh_rids)
+            if batch.prepared_rows else batch.input_edges
+        )
         per_request_inputs, final_edges, unresolved = (
-            batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor, batch.request_to_worker_graph,
+            edges.to_input_tensors(
+                self.tensor_manager.get_tensor,
+                fresh_rids if batch.prepared_rows else batch.request_to_worker_graph,
                 skip_missing=True,
             )
         )
@@ -1749,6 +1769,10 @@ class Worker:
             node_name=batch.node_name, batch_partition=batch_partition,
             per_request_inputs=per_request_inputs,
         )
+        for rid, row in batch.prepared_rows.items():
+            per_request_inputs[rid] = row.tensors
+            per_request_input_metadata[rid] = row.metadata
+            per_request_info[rid] = row.info
 
         node_batch = self._make_executing_batch(
             node_name=batch.node_name,
@@ -1764,6 +1788,11 @@ class Worker:
             request_walks=batch.request_walks,
         )
         node_batch.read_check_rids = batch.read_check_rids
+        node_batch.prepared_rows = batch.prepared_rows
+        node_batch.final_stream_rids.update(rid for rid, row in batch.prepared_rows.items() if row.final_stream)
+        node_batch.stream_partition_done_rids.update(
+            rid for rid, row in batch.prepared_rows.items() if row.partition_done
+        )
         for rid in unresolved:
             # Reported the way a per-rid stage reports: left in
             # ``failed_requests`` for the run loop to drop and fail, so the
@@ -1931,6 +1960,9 @@ class Worker:
     # ------------------------------------------------------------------
     def _push_back_batch(self, batch: ScheduledBatch) -> None:
         """Return a whole batch's nodes to the ready set (admit refusal, OOM)."""
+        if batch.prepared_rows:
+            self.scheduler.defer(batch)
+            return
         rids = list(batch.request_to_worker_graph)
         self._graph_runtime.push_back_node(
             batch.node_name, rids,
@@ -2263,6 +2295,7 @@ class Worker:
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
                 synchronize=False,
             )
+        instance_failed = False
         try:
             try:
                 if node_batch.read_check_rids is not None:
@@ -2273,8 +2306,12 @@ class Worker:
                     cpu="worker.gpu_thread.prepare_inputs.cpu",
                 ):
                     engine.prepare_inputs(node_batch)
+                    self._refine_prepared_batch(batch, node_batch, engine)
             except Exception:
-                if plan_future is not None and node_batch.preplanned_rids is not None:
+                if plan_future is not None and (
+                    node_batch.preplanned_rids is not None
+                    or node_batch.selected_execution is not None
+                ):
                     # The stage was for this batch, which now never runs.
                     engine.reset_pre_plan_for_batch(node_batch)
                 raise
@@ -2290,7 +2327,7 @@ class Worker:
             # Device time of the step; the phase timers only see host submit
             # time, and both are needed to tell a starved iter from a busy one.
             gpu_start = None
-            if self._phase_period and execution_stream is not None:
+            if self._phase_period and execution_stream is not None and self.device_capability.timing_events:
                 gpu_start = torch.Event(device=self.device, enable_timing=True)
                 gpu_start.record(execution_stream)
             if self._phase_period:
@@ -2319,6 +2356,14 @@ class Worker:
                     self._drain_gpu_spans()
                     laps.lap("gpu_exec_events")
             return outputs
+        except Exception as error:
+            agreement = getattr(engine, "execution_agreement", lambda _: None)(batch.node_name)
+            if agreement is not None:
+                instance_failed = True
+                self.parallel_groups.mark_failed()
+                if not isinstance(error, InstanceFatalError):
+                    raise InstanceFatalError(batch.node_name, str(error)) from error
+            raise
         finally:
             # Safety net: a step that raised before the forward would otherwise
             # leave the submitter blocked on this for the full wait timeout.
@@ -2334,10 +2379,11 @@ class Worker:
             # of success, allocation failure, or an uncaught raise —
             # finalize_batch reads whatever state the engine actually reached.
             laps.skip()
-            publish_rids = self._publishable_request_ids(node_batch)
-            node_batch.resource_publish_info = engine.finalize_batch(
-                node_batch, publish_request_ids=publish_rids,
-            )
+            if not instance_failed:
+                publish_rids = self._publishable_request_ids(node_batch)
+                node_batch.resource_publish_info = engine.finalize_batch(
+                    node_batch, publish_request_ids=publish_rids,
+                )
             laps.lap("finalize_batch")
             if timed:
                 self._phase_record(
@@ -2405,6 +2451,7 @@ class Worker:
         # loop-back inputs already spent. A row the cache served is retried,
         # because its walk completes only on a step that runs.
         prepared = set(node_batch.request_ids) | node_batch.cached_rids
+        batch.prepared_rows.update(node_batch.prepared_rows)
         for rid in list(batch.request_to_worker_graph):
             if rid not in prepared:
                 batch.discard_rid(rid)
@@ -2960,6 +3007,7 @@ class Worker:
             self.request_state,
             target=spec_target,
             pre_existing_batch_size=len(continuing),
+            pre_existing_rids=tuple(prep.ready_rids),
             capture_group_of=prep.ready_rids[0],
         )
         laps.lap("fresh_schedule")
@@ -4317,6 +4365,22 @@ class Worker:
         The caller still has to clear its own in-flight state; see the main
         loop's handler.
         """
+        extension = getattr(self, "runtime_extension", None)
+        if extension is not None:
+            extension.check_health()
+            # A returned/failed Python future establishes submission, not
+            # physical completion. Quiesce submitters and drain before this
+            # ordinary request-failure path permits resource reuse.
+            futures = [item.future for item in in_flight if item is not None and item.future is not None]
+            if speculation is not None and speculation.plan_future is not None:
+                futures.append(speculation.plan_future)
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+            extension.drain()
+
         # The exception is usually surfacing out of ``pending.future.result()``,
         # where the concurrent.futures machinery has already wrapped the
         # engine's traceback. Report the leaf exception to the client and keep
@@ -4386,7 +4450,7 @@ class Worker:
 
         self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
 
-    def _fail_requests(self, errors: dict[int, str]) -> None:
+    def _fail_requests(self, errors: dict[int, str], *, status: int = 500) -> None:
         """Report requests this worker can no longer serve to the conductor.
 
         ``errors`` maps request_id -> message. Rids the worker has already
@@ -4411,7 +4475,7 @@ class Worker:
             "conductor",
             ConductorMessage(
                 message_type=ConductorMessageType.FAIL_REQUESTS,
-                body=FailRequests(errors=wire_errors),
+                body=FailRequests(errors=wire_errors, status=status),
             ),
         )
         # Note: we do not cleanup the request right now; we wait for the conductor
@@ -4596,6 +4660,7 @@ class Worker:
             max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}",
             initializer=self._init_engine_thread,
         )
+        self._executors.append(gpu_executor)
         logger.info(
             "Worker %s: engine runs on dedicated GPU thread",
             self.worker_id,
@@ -4621,6 +4686,7 @@ class Worker:
                 max_workers=1, thread_name_prefix=f"mstar-plan-{self.worker_id}",
                 initializer=self._init_engine_thread,
             )
+            self._executors.append(plan_executor)
             logger.info(
                 "Worker %s: plan_executor enabled — speculative plan() "
                 "pre-runs on a dedicated thread",
@@ -4712,9 +4778,11 @@ class Worker:
         spec_pending: PendingBatch | None = None
         speculation: Speculation | None = None
 
-        while True:
+        while not self._stop_requested:
             from mstar.utils.profiler import range_pop, range_push
             try:
+                if self.runtime_extension is not None:
+                    self.runtime_extension.check_health()
                 batch = None
                 spec_pending = None
                 _iter_start = _time.perf_counter() if phase_period else 0.0
@@ -4853,6 +4921,13 @@ class Worker:
                                     [sb.request_to_worker_graph[r] for r in fresh],
                                 )
                                 speculation = None
+
+                    if pending.node_batch.deferred_rows:
+                        # A proposed group was too broad, not an invalid
+                        # request. Its interpreted rows keep their input holds;
+                        # dependent speculation cannot assume they produced.
+                        _maybe_clear_spec()
+                        self._park_deferred_rows(pending)
 
                     if pending.node_batch.admit_error is not None:
                         # Admit refused pending, so no forward ran.
@@ -5070,6 +5145,15 @@ class Worker:
                     phase_iter[0] += 1
                     _phase_flush()
             except Exception as e:
+                if isinstance(e, InstanceFatalError):
+                    self.request_stop()
+                    self.parallel_groups.mark_failed()
+                    logger.error("INSTANCE_FATAL: worker=%s node=%s error=%s", self.worker_id, e.node_name, e)
+                    self.communicator.send("conductor", ConductorMessage(
+                        message_type=ConductorMessageType.INSTANCE_FAILED,
+                        body=InstanceFailed(self.worker_id, e.node_name, str(e)),
+                    ))
+                    raise
                 self._handle_main_loop_error(e, (pending, spec_pending), batch, speculation)
                 # Follower: a head from a step that raised must not sit at the
                 # FIFO front with failed rids.
@@ -5081,3 +5165,92 @@ class Worker:
                 _set_pending(None)
                 consecutive_spec_steps = 0
                 sleep(0.01)
+
+    def _park_deferred_rows(self, pending: PendingBatch) -> None:
+        deferred = pending.node_batch.deferred_rows
+        executed, parked = pending.batch.split_off_first(None, exclude_rids=set(deferred))
+        parked.prepared_rows.update(deferred)
+        self.scheduler.defer(parked)
+        if executed is None:
+            executed = ScheduledBatch(pending.node_name, pending.graph_walk)
+        else:
+            executed.relabel_if_uniform()
+        pending.batch = executed
+        pending.graph_walk = executed.graph_walk
+
+    def _refine_prepared_batch(self, batch: ScheduledBatch, node_batch: ExecutingBatch, engine) -> None:
+        """Resolve a proposal with logical facts, before workspace or resources.
+
+        No scheduler state is mutated on this thread. Unused rows move back to
+        its backlog when the main thread reconciles the completed proposal.
+        """
+        capabilities = engine.execution_capabilities(batch.node_name)
+        agreement = getattr(engine, "execution_agreement", lambda _: None)(batch.node_name)
+        if agreement is not None:
+            agreement.agree((
+                tuple(self._rid_str(rid) for rid in node_batch.request_ids),
+                tuple(row.input_seq_len for row in node_batch.inputs),
+                tuple(node_batch.step_context.walk_of(rid) for rid in node_batch.request_ids),
+                engine.resource_facts(batch.node_name, node_batch.request_ids),
+                tuple(sorted(self._rid_str(rid) for rid in node_batch.failed_requests)),
+            ), "prepared proposal")
+            capabilities = agreement.refinement_capabilities(capabilities)
+        if capabilities is None or not node_batch.request_ids:
+            return
+        lengths = dict(zip(node_batch.request_ids, (row.input_seq_len for row in node_batch.inputs), strict=True))
+        walks = {rid: node_batch.step_context.walk_of(rid) for rid in node_batch.request_ids}
+
+        def facts_for(walk, rids):
+            return InvocationFacts(
+                walk, len(rids), tuple(lengths[rid] for rid in rids),
+                engine.resource_facts(batch.node_name, rids),
+                tuple(walks[rid] for rid in rids),
+            )
+
+        actual_walks = set(walks.values())
+        walk = next(iter(actual_walks)) if len(actual_walks) == 1 else node_batch.graph_walk
+        selected = tuple(node_batch.request_ids)
+        possibilities = (
+            capabilities.possibilities if agreement is None
+            else lambda facts: agreement.possibilities(capabilities, facts)
+        )
+        if not possibilities(facts_for(walk, selected)):
+            selected = choose_capability_rows(
+                node_batch.request_ids, capabilities=capabilities,
+                graph_walk=batch.graph_walk, walk_of=walks.__getitem__, facts_for=facts_for,
+                possibilities=possibilities,
+            ).request_ids
+        node_batch.defer_except(selected)
+        if selected:
+            actual_walks = {walks[rid] for rid in selected}
+            walk = next(iter(actual_walks)) if len(actual_walks) == 1 else batch.graph_walk
+            node_batch.step_context.graph_walk = walk
+            node_batch.step_context.request_walks = (
+                {rid: walks[rid] for rid in selected} if len(actual_walks) > 1 else {}
+            )
+            node_batch.rows_only = self._all_on_device(
+                engine, batch.node_name, walk,
+                batch.walk_output_signals.get(walk, batch.output_signals),
+            )
+            node_batch.loopback_rids = (
+                node_batch.loopback_rids.intersection(selected) if len(actual_walks) > 1 else frozenset()
+            )
+
+    def close(self) -> None:
+        """Quiesce submitters, settle native work, then release runtime owners."""
+        self.request_stop()
+        for executor in getattr(self, "_executors", ()):
+            executor.shutdown(wait=False, cancel_futures=True)
+        for executor in getattr(self, "_executors", ()):
+            executor.shutdown(wait=True)
+        if self.runtime_extension is not None:
+            self.runtime_extension.drain()
+        if hasattr(self, "engine_manager"):
+            self.engine_manager.shutdown()
+        if hasattr(self, "tensor_manager"):
+            self.tensor_manager.shutdown()
+        if hasattr(self, "parallel_groups"):
+            self.parallel_groups.close()
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
