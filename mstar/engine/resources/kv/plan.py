@@ -7,6 +7,7 @@ consumer depends on the contract rather than on the cache.
 """
 
 import itertools
+from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
@@ -232,19 +233,71 @@ def _host_lens(values: list[int]) -> torch.Tensor:
     return _int32_tensor(values).as_subclass(HostLens)
 
 
+class KVWritePlan(NamedTuple):
+    """Host write addresses, in the invocation's packed token order.
+
+    Owns its CPU tensors for the invocation. A physical implementation may
+    copy or pack them; it never invents pages or advances request lengths.
+    """
+    token_to_page: torch.Tensor
+    token_to_cache: torch.Tensor
+    total_tokens: int
+
+
+def build_write_plan(views: list[SequenceView], page_size: int) -> KVWritePlan:
+    pages, slots = [], []
+    for view in views:
+        start = view.start + view.length - view.to_compute
+        for position in range(start, start + view.to_compute):
+            pages.append(view.page_idxs[position // page_size])
+            slots.append(position % page_size)
+    return KVWritePlan(torch.tensor(pages, dtype=torch.long),
+                       torch.tensor(slots, dtype=torch.long), len(pages))
+
+
+class _HostWritePlan:
+    """Invocation-local addresses, materialized only by a tensor consumer."""
+
+    def __init__(self, views: tuple[SequenceView, ...], page_size: int):
+        # Preserve the eager builder's page-address validation without creating
+        # per-token lists or tensors. Intermediate page indices are monotonic.
+        for view in views:
+            start = view.start + view.length - view.to_compute
+            if view.to_compute > 0:
+                view.page_idxs[start // page_size]
+                view.page_idxs[(start + view.to_compute - 1) // page_size]
+        self._views = views
+        self._page_size = page_size
+        self._value: KVWritePlan | None = None
+
+    def __call__(self) -> KVWritePlan:
+        if self._value is None:
+            self._value = build_write_plan(self._views, self._page_size)
+        return self._value
+
+
 class KVPlanOutput:
     """
     Output of KVManager.plan for a single label
     """
 
-    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+    __slots__ = (
+        "_cpu_indptrs", "_indptr_builder", "_query_lengths", "_views", "_view_builder",
+        "cuda_indptrs", "decode_pages", "decode_offsets", "rows", "_write_locations", "_write_builder",
+    )
 
     def __init__(
-        self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
+        self, cpu_indptrs: PagedIndptrs | None, views: "list[SequenceView] | None" = None,
         cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
-        rows=None, view_builder=None,
+        rows=None, view_builder=None, *, indptr_builder: Callable[[], PagedIndptrs] | None = None,
+        write_builder: Callable[[], KVWritePlan] | None = None,
+        query_lengths: tuple[int, ...] | None = None,
     ):
-        self.cpu_indptrs = cpu_indptrs
+        self._write_locations: KVWritePlan | None = None
+        self._write_builder = write_builder
+        self._cpu_indptrs = cpu_indptrs
+        self._indptr_builder = indptr_builder
+        self._query_lengths = query_lengths
         # packing in plan order w/h 1 view per segment covered by plan; a plan
         # off the KV manager's cache hands a builder instead and the views are
         # made on first use (the FlashInfer path never asks for them)
@@ -271,7 +324,40 @@ class KVPlanOutput:
     def views(self, value):
         self._views = value
 
+    @property
+    def cpu_indptrs(self) -> PagedIndptrs | None:
+        if self._cpu_indptrs is None and self._indptr_builder is not None:
+            self._cpu_indptrs = self._indptr_builder()
+        return self._cpu_indptrs
+
+    @cpu_indptrs.setter
+    def cpu_indptrs(self, value):
+        self._cpu_indptrs = value
+        self._indptr_builder = None
+        self._query_lengths = None
+
+    @property
+    def write_locations(self) -> KVWritePlan | None:
+        if self._write_locations is None and self._write_builder is not None:
+            self._write_locations = self._write_builder()
+        return self._write_locations
+
+    @write_locations.setter
+    def write_locations(self, value):
+        self._write_locations = value
+        self._write_builder = None
+
+    @property
+    def query_lengths(self) -> tuple[int, ...]:
+        # Once exposed, the mutable tensor remains authoritative.
+        if self._cpu_indptrs is None and self._query_lengths is not None:
+            return self._query_lengths
+        values = self.cpu_indptrs.qo_indptr.tolist()
+        return tuple(b - a for a, b in itertools.pairwise(values))
+
     def get_total_len(self):
+        if self._cpu_indptrs is None and self._query_lengths is not None:
+            return sum(self._query_lengths)
         return int(self.cpu_indptrs.qo_indptr[-1])
 
     @property

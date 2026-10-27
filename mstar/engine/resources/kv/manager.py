@@ -26,6 +26,7 @@ from mstar.engine.resources.kv.config import (
     KVSpec,
     KVStep,
     PagedKVConfig,
+    ResolvedSequenceConfig,
     PrefixSpan,
     RetentionPolicy,
     StreamLayout,
@@ -35,6 +36,7 @@ from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, pa
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
+    _HostWritePlan,
     KVPlanOutput,
     KVPlanOutputs,
     PagedIndptrs,
@@ -423,6 +425,20 @@ class KVPlanState:
         self.total_tokens = n
 
 
+@dataclass
+class _HostKVPlanState:
+    addresses: _HostWritePlan
+    total_tokens: int
+
+    @property
+    def token_to_page(self) -> torch.Tensor:
+        return self.addresses().token_to_page
+
+    @property
+    def token_to_cache(self) -> torch.Tensor:
+        return self.addresses().token_to_cache
+
+
 class _LabelRows:
     """One plan label's real rows of a cached decode plan, derived from the
     full plan's views at the first hit: streams, lengths, page lists and the
@@ -487,12 +503,16 @@ class KVManager(AttentionResource):
         device: torch.device,
         dtype=torch.bfloat16,
         needs_remote_transfer: bool = False,
+        *,
+        cache: KVCache | None = None,
+        host_plan: bool = False,
     ):
         self.config = cfg
         tp_cache = False
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
-            cfg.shard(joint_comm_group.world_size)
+            if not isinstance(cfg, ResolvedSequenceConfig):
+                cfg.shard(joint_comm_group.world_size)
             tp_cache = joint_comm_group.world_size > 1 and cfg.prefix_cache and cfg.prefix_cache_tp
             if tp_cache and cfg.cpu_offload_pages > 0:
                 raise ValueError(
@@ -508,9 +528,8 @@ class KVManager(AttentionResource):
                     "and a read from another group would take pages outside rank 0's order. Serve "
                     "the nodes from one group or set prefix_cache_tp to false."
                 )
-        self.kv_cache = KVCache(
-            cfg, device, dtype
-        )
+        self.kv_cache = cache if cache is not None else KVCache(cfg, device, dtype)
+        self._host_plan = host_plan
         self.name = name
 
         self._arena = PageArena(
@@ -588,13 +607,13 @@ class KVManager(AttentionResource):
         self._plan_cache_mode = kv_plan_cache()
         # FlashInfer's index arrays from page-locked memory (see PinnedIndexRing)
         self._indptr_ring = (
-            PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
+            PinnedIndexRing() if not host_plan and kv_pinned_indptrs() and torch.cuda.is_available() else None
         )
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
-        self._current_plan_states: dict[str, KVPlanState] = {}
+        self._current_plan_states: dict[str, KVPlanState | _HostKVPlanState] = {}
         self.reset_default_cursors()
 
-        self._preplan_states: dict[str, KVPlanState] = {}
+        self._preplan_states: dict[str, KVPlanState | _HostKVPlanState] = {}
         self._preplanned = False
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
@@ -619,6 +638,9 @@ class KVManager(AttentionResource):
         # pre-planned step's admit returns first -- see ``remove_request`` /
         # ``reset_request``.
         self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
+        # Dense blocks are cleared on the execution stream after admission,
+        # never while a reversible reservation is being made.
+        self._pending_initialization: dict[tuple[int, str], list[int]] = {}
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -631,6 +653,14 @@ class KVManager(AttentionResource):
             dtype=info.kv_dtype,
             needs_remote_transfer=info.needs_remote_transfer,
         )
+
+    def logical_use(self, plans):
+        from mstar.engine.resources.sequence_view import SequenceUse
+        return {label: SequenceUse.from_plan(plan) for label, plan in plans.items()}
+
+    def view(self, request):
+        from mstar.engine.resources.sequence_view import sequence_access
+        return sequence_access(self, request)
 
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
@@ -1441,9 +1471,10 @@ class KVManager(AttentionResource):
         stream.hold = None
 
     def fingerprint(self) -> bytes:
+        encoding = self.kv_cache.encoding
         return fingerprint(
             self.config.layout.value, self.config.page_size,
-            self.kv_cache.tensor.dtype, self._world_size,
+            type(encoding).__module__, type(encoding).__qualname__, encoding, self._world_size,
             self.config.prefix_cache_salt,
         )
 
@@ -1682,6 +1713,11 @@ class KVManager(AttentionResource):
         return label
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
+        if isinstance(self.config, ResolvedSequenceConfig) and self.config.dense:
+            if not step.commit or step.pre_forks or step.post_forks or step.retention:
+                return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
+                    message="dense sequence storage supports committed append steps; forks and retention require another representation",
+                ))
         if self._preplanned and not ctx.is_preplan:
             if self._preplan_key == self._plan_key(step, ctx):
                 # pages were already reserved by the preplan pass — and the record
@@ -1945,6 +1981,10 @@ class KVManager(AttentionResource):
                 # so an offload that claimed this stream mid-admit notices its
                 # host copy no longer describes it and aborts
                 stream.generation += 1
+                pending = self._pending_initialization.pop((rid, label), ())
+                retained = [page for page in pending if page not in pages]
+                if retained:
+                    self._pending_initialization[(rid, label)] = retained
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -1952,6 +1992,10 @@ class KVManager(AttentionResource):
         """Drop ``rid``'s unwind record. Caller holds the lock."""
         for key in [k for k in self._admit_reserved_pages if k[0] == rid]:
             del self._admit_reserved_pages[key]
+        for key in [k for k in self._pending_initialization if k[0] == rid]:
+            del self._pending_initialization[key]
+        self._preplan_marked = [key for key in self._preplan_marked if key[0] != rid]
+        self._preplan_new_labels = [key for key in self._preplan_new_labels if key[0] != rid]
 
     def _forget_step_reservations(self, ctx: StepContext) -> None:
         """Drop the unwind record of this step's rows only. Caller holds the lock."""
@@ -2101,6 +2145,21 @@ class KVManager(AttentionResource):
         ctx: StepContext, lease,
     ):
         for label, indptrs in plan_output.items():
+            if self._host_plan:
+                # The native realization consumes host addresses directly;
+                # no torch kernels or device index materialization is implied.
+                addresses = indptrs._write_builder
+                if addresses is None:
+                    # A leased decode-cache result already owns its indptrs,
+                    # but its optional host write representation can still wait.
+                    snapshot = tuple(view._replace(page_idxs=tuple(view.page_idxs))
+                                     for view in indptrs.views)
+                    addresses = _HostWritePlan(snapshot, self.kv_cache.page_size)
+                    indptrs._write_builder = addresses
+                plan_state = _HostKVPlanState(addresses, indptrs.get_total_len())
+                target = self._preplan_states if ctx.is_preplan else self._current_plan_states
+                target[label] = plan_state
+                continue
             if indptrs.is_decode and lease is not None:
                 # Straight into the captured buffers in one H2D per buffer:
                 # this runs in the pre-plan beside a live graph, where a
@@ -2138,6 +2197,19 @@ class KVManager(AttentionResource):
 
 
     def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
+        if self._host_plan:
+            # Never read streams again when a retained plan materializes later.
+            # Separate snapshots also preserve eager tensor independence from
+            # mutations to the public views/page lists before their first use.
+            snapshot = tuple(view._replace(page_idxs=tuple(view.page_idxs)) for view in views)
+            page_size = self.kv_cache.page_size
+            addresses = _HostWritePlan(snapshot, page_size)
+            return KVPlanOutput(
+                cpu_indptrs=None, views=views,
+                indptr_builder=lambda: build_paged_indptrs(snapshot, page_size),
+                write_builder=addresses,
+                query_lengths=tuple(view.to_compute for view in snapshot),
+            )
         return KVPlanOutput(
             cpu_indptrs=build_paged_indptrs(
                 views, self.kv_cache.page_size, ring=self._indptr_ring,
@@ -2451,6 +2523,15 @@ class KVManager(AttentionResource):
             "res.pre_plan.kv_cache." if ctx.is_preplan else "res.plan.kv_cache."
         )
         self.reset_default_cursors()
+        if not ctx.is_preplan and self._pending_initialization:
+            with self._lock:
+                for segment in step.segments:
+                    pages = self._pending_initialization.pop((segment.request_id, segment.label), ())
+                    for page in pages:
+                        # Each layer's request block is contiguous; selecting
+                        # every layer at once would produce a strided view.
+                        for layer in self.kv_cache.tensor:
+                            layer[page].zero_()
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):
                 self._current_plan_states = self._preplan_states
@@ -2523,9 +2604,12 @@ class KVManager(AttentionResource):
             self._cached_plan_output = res
         return res
 
+    def can_capture(self) -> bool:
+        return not self._host_plan
+
     @property
     def supports_preplan(self):
-        return True
+        return not self._host_plan
 
     @staticmethod
     def _plan_key(step: KVStep, ctx: StepContext):
@@ -2579,6 +2663,7 @@ class KVManager(AttentionResource):
                 stream = self._streams.get(rid, {}).pop(label, None)
                 if stream is not None:
                     self._arena.release(stream.page_indices)
+                self._pending_initialization.pop((rid, label), None)
             self._preplan_new_labels = []
             for rid, label in self._preplan_marked:
                 stream = self._streams.get(rid, {}).get(label)
@@ -3366,6 +3451,8 @@ class KVManager(AttentionResource):
             self._forget_reservations(rid)
             for label, stream in self._streams.get(rid, {}).items():
                 self._seed_keys(rid, label, stream)
+                if isinstance(self.config, ResolvedSequenceConfig) and self.config.dense and stream.page_indices:
+                    self._pending_initialization[(rid, label)] = list(stream.page_indices)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -3653,6 +3740,10 @@ class KVManager(AttentionResource):
         self, request_id: str, label: str, seq_len: int
     ) -> AllocResult:
         with self._lock:
+            if isinstance(self.config, ResolvedSequenceConfig) and self.config.dense and seq_len > self.config.max_seq_len:
+                return AllocResult(success=False, error=AdmitRuntimeError(
+                    message=f"sequence length {seq_len} exceeds dense capacity {self.config.max_seq_len}",
+                ))
             self._ensure_label(request_id, label)
             stream = self._streams[request_id][label]
             if stream.offloaded:
@@ -3689,6 +3780,8 @@ class KVManager(AttentionResource):
                         )
                     )
                 stream.page_indices.extend(new_pages)
+                if isinstance(self.config, ResolvedSequenceConfig) and self.config.dense:
+                    self._pending_initialization.setdefault((request_id, label), []).extend(new_pages)
                 stream.generation += 1
                 if stream.footprint is not None and len(stream.page_indices) > stream.footprint:
                     self._report_overrun(request_id, label, stream)

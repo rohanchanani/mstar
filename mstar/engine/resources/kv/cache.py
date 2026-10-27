@@ -4,10 +4,9 @@ import queue
 import threading
 
 import torch
-import triton
-import triton.language as tl
 
-from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig, ResolvedSequenceConfig
+from mstar.engine.resources.kv.encoding import PlainKVEncoding, plain_kv_dtype
 
 
 class PageAllocator:
@@ -55,30 +54,6 @@ class PageAllocator:
         return self.free_pages.qsize()
 
 
-@triton.jit
-def _kv_scatter_nhd_kernel(
-    layer_ptr, k_ptr, v_ptr, page_idx_ptr, cache_idx_ptr,
-    stride_page, stride_kv, stride_slot,
-    stride_kt, stride_kh, stride_vt, stride_vh,
-    num_pages, page_size,
-    HEADS: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK: tl.constexpr,
-):
-    token = tl.program_id(0).to(tl.int64)
-    page = tl.load(page_idx_ptr + token).to(tl.int64)
-    slot = tl.load(cache_idx_ptr + token).to(tl.int64)
-    # A bad index would overwrite another page's KV. Compiled in only with TRITON_DEBUG=1.
-    tl.device_assert((page >= 0) & (page < num_pages), "KV page index out of range")
-    tl.device_assert((slot >= 0) & (slot < page_size), "KV slot index out of range")
-    offs = tl.arange(0, BLOCK)
-    mask = offs < HEADS * HEAD_DIM
-    head, dim = offs // HEAD_DIM, offs % HEAD_DIM
-    dst = layer_ptr + page * stride_page + slot * stride_slot + offs
-    k = tl.load(k_ptr + token * stride_kt + head * stride_kh + dim, mask=mask)
-    v = tl.load(v_ptr + token * stride_vt + head * stride_vh + dim, mask=mask)
-    tl.store(dst, k.to(layer_ptr.dtype.element_ty), mask=mask)
-    tl.store(dst + stride_kv, v.to(layer_ptr.dtype.element_ty), mask=mask)
-
-
 @torch.compiler.disable
 def _kv_scatter_mla_eager(
     cache: torch.Tensor, layer_idx: int,
@@ -106,6 +81,9 @@ def _kv_scatter_nhd_eager(
         and page_idx.numel() == tokens and cache_idx.numel() == tokens
         and all(t.device == cache.device for t in (k, v, page_idx, cache_idx))
     ):
+        import triton
+        from mstar.engine.resources.kv.kernels import _kv_scatter_nhd_kernel
+
         block = triton.next_power_of_2(heads * head_dim)
         # One launch for K and V instead of two index_put kernels.
         _kv_scatter_nhd_kernel[(tokens,)](
@@ -130,16 +108,27 @@ class KVCache:
         self,
         cfg: PagedKVConfig,
         device: torch.device,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
+        *,
+        storage: torch.Tensor | None = None,
     ):
         self.config = cfg
+        self.encoding = (cfg.encoding if isinstance(cfg, ResolvedSequenceConfig)
+                         else PlainKVEncoding(torch.get_default_dtype() if dtype is None else dtype))
+        dtype = plain_kv_dtype(self.encoding)
         if cfg.layout == KVLayout.NHD:
-            self.tensor = torch.zeros(
-                cfg.num_layers, cfg.max_num_pages, 2,
-                cfg.page_size, cfg.num_kv_heads, cfg.head_dim,
-                dtype=dtype, device=device,
-            ).contiguous()
+            shape = (cfg.num_layers, cfg.max_num_pages, 2,
+                     cfg.page_size, cfg.num_kv_heads, cfg.head_dim)
+            if storage is None:
+                storage = torch.zeros(shape, dtype=dtype, device=device)
+            elif tuple(storage.shape) != shape or storage.dtype != dtype or storage.device != device:
+                raise ValueError("KV storage must match the resolved shape, dtype and device")
+            if not storage.is_contiguous():
+                raise ValueError("NHD KV storage must be contiguous")
+            self.tensor = storage
         elif cfg.layout == KVLayout.MLA:
+            if storage is not None:
+                raise ValueError("External KV storage is only supported for NHD layout")
             # [layer, page, token, ckv | kpe]; the attention kernel takes the two
             # column slices as strided views (page/token strides are explicit
             # kernel params, only the last dim must be contiguous)
