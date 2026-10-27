@@ -1739,6 +1739,13 @@ picks one per node group with an ``ep_config`` block; see :doc:`serving` for the
 shared pieces are in ``mstar/model/components/moe_parallel.py``. The Qwen3-Omni Thinker
 (``mstar/model/qwen3_omni/components/thinker.py``) is the reference user.
 
+The ``ep_config`` options configure this upstream physical implementation. Nodes
+selected by ``runtime_extension.nodes`` instead use their registered acceleration's
+partitioning and collective algorithms, over the participant groups supplied by M*.
+Specifying ``ep_config`` for one of those nodes is a startup configuration error:
+remove that option or leave the node on the upstream construction path. Other
+nodes in the same deployment retain their upstream options.
+
 To support it in a model:
 
 1. **Declare the node EP-enabled.** Add it to ``ep_enabled_nodes`` in

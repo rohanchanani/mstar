@@ -40,6 +40,26 @@ def extension_selects_node(model_config, node_name):
     return node_name in nodes
 
 
+def validate_implementation_options(model_config):
+    """Legacy physical options must name nodes using their original consumer."""
+    if model_config.get("runtime_extension") is None:
+        return
+    extension_selects_node(model_config, "")
+    conflicting = sorted({
+        node for group in model_config.get("node_groups", ())
+        if "ep_config" in group
+        for node in group["node_names"]
+        if extension_selects_node(model_config, node)
+    })
+    if conflicting:
+        raise ValueError(
+            f"ep_config configures the upstream physical implementation, but nodes "
+            f"{conflicting} select runtime_extension implementations. Remove ep_config "
+            "for those nodes or exclude them from runtime_extension.nodes; "
+            "registry implementations choose their own distributed algorithms."
+        )
+
+
 def run_managed_worker(worker_class, kwargs, extension, owner, *, cleanup_worker=None):
     """Drain native work on normal shutdown; use upstream orphan escalation."""
     logger = logging.getLogger(__name__)

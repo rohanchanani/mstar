@@ -12,6 +12,7 @@ from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
 from mstar.model.base import Model, WorkerGraph
+from mstar.runtime_extensions import validate_implementation_options
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems
 from mstar.validation.resources import check_resources, resources_shape_problem
@@ -83,6 +84,10 @@ def validate_deployment(
     problems += malformed
     deployment = None
     if not malformed:
+        try:
+            validate_implementation_options(config)
+        except (ValueError, *_UNREADABLE) as e:
+            problems.append(f"implementation selection: {e}")
         # refuses the placement (check_placement) once the model has read it
         try:
             worker_graphs = model.get_worker_graphs(config_path)
