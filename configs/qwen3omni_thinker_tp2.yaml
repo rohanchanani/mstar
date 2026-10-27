@@ -1,5 +1,14 @@
 model: "qwen3_omni"
 max_seq_len: 32768
+# Byte budgets preserve the original 128-token page capacity at BF16 for the
+# published 30B checkpoint and this deployment's TP head partition.
+resources:
+  thinker_kv:
+    max_bytes: 12884901888
+    prefix_cache: true
+  talker_kv:
+    max_bytes: 5368709120
+    prefix_cache: true
 node_groups:
   - node_names: [Thinker]
     ranks: [0, 1]

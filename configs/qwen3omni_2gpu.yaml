@@ -1,12 +1,15 @@
 model: "qwen3_omni"
 max_seq_len: 32768
-# The Thinker's KV pool defaults to 2,048 pages, 24 GiB at 12 MiB a page, which
-# doesn't fit beside its weights on an 80 GB GPU; qwen3omni_2gpu_large_kv.yaml
-# keeps the default for larger GPUs. Host pages give a full pool a request to move.
+# Byte budgets preserve the original 128-token page capacity at BF16 for the
+# published 30B checkpoint and this deployment's TP head partition.
 resources:
   thinker_kv:
-    max_num_pages: 1024
-    cpu_offload_pages: 1024
+    max_bytes: 12884901888
+    prefix_cache: true
+    cpu_offload_bytes: 12884901888
+  talker_kv:
+    max_bytes: 5368709120
+    prefix_cache: true
 node_groups:
   - node_names: [audio_encoder, vision_encoder]
     ranks: [1]

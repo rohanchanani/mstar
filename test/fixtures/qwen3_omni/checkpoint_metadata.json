@@ -1,0 +1,9 @@
+{
+  "repo_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+  "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+  "config_sha256": "eab5093d47807aaf894119506b238b2b1cee70d08456e894fee9a012d88f2e0d",
+  "index_sha256": "03ffe9a54efe9007ceb788c2b036f5c589094918c4582add4e92bc17e1cba838",
+  "talker_tensor_count": 8037,
+  "sorted_newline_talker_names_sha256": "1d62ca8fa626799eed0609998c00afa2c17ccd255c86020e07348c7d90583984",
+  "sorted_talker_shapes_json_sha256": "701cb77a0b72b687d3f82e3bef40d8ee96a8447a53303f257e4a98778392baf6"
+}

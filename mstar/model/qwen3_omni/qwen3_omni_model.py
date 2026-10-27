@@ -33,7 +33,6 @@ from pathlib import Path
 
 import torch
 from jinja2 import TemplateError
-from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -46,12 +45,12 @@ from mstar.engine.resources import (
     AttentionSpec,
     KVSpec,
     NodeResourceSpec,
-    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    SequenceKVConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -79,7 +78,6 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
-from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
@@ -119,8 +117,53 @@ def apply_code2wav_serving_overrides(code2wav, model_kwargs: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
+def _fetch_video_without_torchcodec(filepath: str, image_patch_size: int) -> tuple[torch.Tensor, float]:
+    """qwen_omni_utils' fetch_video, decoding with media_io instead. Without
+    torchcodec, fetch_video falls back to decord and then to
+    torchvision.io.read_video, which torchvision 0.27 dropped. This picks the
+    same frames as its torchcodec reader and resizes them the same way."""
+    from qwen_omni_utils.v2_5 import vision_process as vp
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as TF
+
+    from mstar.model.components.media_io import sample_video
+
+    ele = {"video": filepath}
+    picked: dict = {}
+
+    def choose(metadata: dict) -> list[int]:
+        fps, total = metadata["average_fps"], metadata["num_frames"]
+        start, end, total = vp.calculate_video_frame_range(ele, total, fps)
+        nframes = vp.smart_nframes(ele, total_frames=total, video_fps=fps)
+        picked["sample_fps"] = nframes / max(total, 1e-6) * fps
+        return torch.linspace(start, end, nframes).round().long().tolist()
+
+    video = sample_video(filepath, choose, on_frames=VideoBudget().add).data
+    image_factor = image_patch_size * vp.SPATIAL_MERGE_SIZE
+    min_pixels = vp.VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
+    total_pixels = vp.MODEL_SEQ_LEN * image_factor * image_factor * 0.9
+    nframes, _, height, width = video.shape
+    max_pixels = max(
+        min(vp.VIDEO_MAX_TOKEN_NUM * image_factor * image_factor, total_pixels / nframes * vp.FRAME_FACTOR),
+        int(min_pixels * 1.05),
+    )
+    resized_height, resized_width = vp.smart_resize(
+        height, width, factor=image_factor, min_pixels=min_pixels, max_pixels=max_pixels,
+    )
+    video = TF.resize(
+        video, [resized_height, resized_width], interpolation=InterpolationMode.BICUBIC, antialias=True,
+    ).float()
+    return video, picked["sample_fps"]
+
+
+def _resolve_local_hf_snapshot(
+    repo_id: str, cache_dir: str | None = None, *, local_files_only: bool = False,
+) -> str:
     """Download (or locate) a HuggingFace snapshot and return the local path."""
+    if Path(repo_id).is_dir():
+        return str(Path(repo_id).resolve())
+    if local_files_only:
+        raise FileNotFoundError(f"model description requires a local configuration directory: {repo_id}")
     from huggingface_hub import snapshot_download
 
     try:
@@ -148,8 +191,12 @@ class Qwen3OmniModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        moe_backend: str = "auto",
+        local_files_only: bool = False,
         **kwargs,
     ):
+        """``moe_backend`` comes from the serving config's ``model_kwargs:`` and
+        picks the Thinker's and Talker's MoE kernels (see MoEBackend)."""
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
 
@@ -175,25 +222,48 @@ class Qwen3OmniModel(Model):
         # Load config from pretrained checkpoint
         from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
 
-        local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
+        local_dir = _resolve_local_hf_snapshot(
+            model_path_hf, cache_dir=cache_dir, local_files_only=local_files_only,
+        )
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
         apply_code2wav_serving_overrides(self.config.code2wav, kwargs)
+        self.config.thinker_text.moe_backend = moe_backend
+        self.config.talker_text.moe_backend = moe_backend
 
-        # Tokenizer (Thinker uses a Qwen-family tokenizer). Qwen3-Omni is native
-        # in transformers, so no loader here runs code from the checkpoint repo.
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            local_dir, cache_dir=cache_dir, trust_remote_code=False,
-        )
+        self._tokenizer = None
+        self._processor_cache = None
+        self._processor_loaded = False
+        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
-        # Full multimodal processor: combines tokenizer + image_processor +
-        # video_processor + audio feature_extractor + chat template support.
-        # Used by process_prompt to build the full ChatML prompt with the
-        # correct image_pad / audio_pad / video_pad expansion.
+    @classmethod
+    def describe(cls, **model_kwargs):
+        """Read the graph, geometry and logical interfaces without model assets."""
+        return cls(**(model_kwargs | {"local_files_only": True}))
+
+    @property
+    def tokenizer(self):
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.local_dir, cache_dir=self.cache_dir,
+                local_files_only=True, trust_remote_code=False,
+            )
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, value):
+        self._tokenizer = value
+
+    @property
+    def _processor(self):
+        if self._processor_loaded:
+            return self._processor_cache
         try:
             from transformers import AutoProcessor
-            self._processor = AutoProcessor.from_pretrained(
-                local_dir, cache_dir=cache_dir, trust_remote_code=False,
+            self._processor_cache = AutoProcessor.from_pretrained(
+                self.local_dir, cache_dir=self.cache_dir,
+                local_files_only=True, trust_remote_code=False,
             )
         except Exception as e:
             logger.warning(
@@ -201,23 +271,27 @@ class Qwen3OmniModel(Model):
                 "process_prompt will fall back to raw tokenizer.encode.",
                 e,
             )
-            self._processor = None
+            self._processor_cache = None
+        self._processor_loaded = True
+        return self._processor_cache
 
-        # Lazy submodule cache -- each worker only loads what it needs
-        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+    @_processor.setter
+    def _processor(self, value):
+        self._processor_cache = value
+        self._processor_loaded = True
 
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        thinker_kv = PagedKVConfig(
+        thinker_kv = SequenceKVConfig(
             num_layers=self.config.thinker_text.num_hidden_layers,
             num_kv_heads=self.config.thinker_text.num_key_value_heads,
             head_dim=self.config.thinker_head_dim,
             max_seq_len=self.config.thinker_text.max_position_embeddings,
             num_qo_heads=self.config.thinker_text.num_attention_heads,
         )
-        talker_kv = PagedKVConfig(
+        talker_kv = SequenceKVConfig(
             num_layers=self.config.talker_text.num_hidden_layers,
             num_kv_heads=self.config.talker_text.num_key_value_heads,
             head_dim=self.config.talker_head_dim,
@@ -1054,21 +1128,26 @@ class Qwen3OmniModel(Model):
         self, filepath: str, device: str
     ) -> TensorAndMetadata:
         # TODO: support audio in video
-        from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes
+        from mstar.model.components.media_io import uses_torchcodec
 
-        install_budgeted_readers(VIDEO_READER_BACKENDS)
-        # the sampled readers decode the frames fetch_video samples, at full size before resizing them
-        probe = probe_video(filepath)
-        if probe is not None:
-            total, fps, height, width = probe
-            VideoBudget().add(height, width, smart_nframes({"video": filepath}, total_frames=total, video_fps=fps))
-        with header_charged(probe is not None):
-            video_input, video_sample_fps = fetch_video(
-                {"video": filepath},
-                return_video_sample_fps=True,
-                image_patch_size=14,
-                return_video_metadata=False
-            )
+        if uses_torchcodec():
+            from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes
+
+            install_budgeted_readers(VIDEO_READER_BACKENDS)
+            # the sampled readers decode the frames fetch_video samples, at full size before resizing them
+            probe = probe_video(filepath)
+            if probe is not None:
+                total, fps, height, width = probe
+                VideoBudget().add(height, width, smart_nframes({"video": filepath}, total_frames=total, video_fps=fps))
+            with header_charged(probe is not None):
+                video_input, video_sample_fps = fetch_video(
+                    {"video": filepath},
+                    return_video_sample_fps=True,
+                    image_patch_size=14,
+                    return_video_metadata=False
+                )
+        else:
+            video_input, video_sample_fps = _fetch_video_without_torchcodec(filepath, image_patch_size=14)
         return TensorAndMetadata(
             data=video_input.to(device),
             metadata=dict(
@@ -1386,6 +1465,30 @@ class Qwen3OmniModel(Model):
     # Model ABC: submodule loading
     # -----------------------------------------------------------------------
 
+    def create_submodule(self, node_name: str) -> NodeSubmodule:
+        if node_name == "Thinker":
+            from mstar.model.qwen3_omni.thinker_logical import ThinkerLogical
+            return ThinkerLogical(self.config)
+        if node_name == "audio_encoder":
+            from mstar.model.qwen3_omni.audio_logical import AudioEncoderLogical
+            return AudioEncoderLogical(self.config)
+        if node_name != "Talker":
+            raise NotImplementedError(
+                f"Qwen node {node_name!r} uses the reference path; no logical binding is registered for this node"
+            )
+        from mstar.model.qwen3_omni.logical import TalkerSubmodule
+        from mstar.model.qwen3_omni.weights import load_conditioning_embeddings
+        return TalkerSubmodule(
+            config=self.config,
+            conditioning_source=lambda: load_conditioning_embeddings(self.local_dir, self.config),
+        )
+
+    def logical_weights(self):
+        from mstar.model.qwen3_omni.weights import logical_weights
+        if not hasattr(self, "_logical_weight_source"):
+            self._logical_weight_source = logical_weights(self.local_dir, self.config)
+        return self._logical_weight_source
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -1467,57 +1570,16 @@ class Qwen3OmniModel(Model):
             return f"{prefix}.experts.{proj}.__expert{expert_idx}__.weight"
         return name
 
-    # MoE stacked param rules: route per-expert projections into fused params.
-    # The shard_id encodes both the projection type AND the expert index.
-    # The __expertN__ marker is injected by _thinker_remap; weight_loaders
-    # parse it to determine the expert slot.
-    _THINKER_STACKED_PARAMS: list = []  # populated lazily below
-
     def _get_thinker_stacked_params(self):
-        from mstar.model.loader.base import StackedParamRule
-
-        if self._THINKER_STACKED_PARAMS:
-            return self._THINKER_STACKED_PARAMS
-        E = self.config.thinker_text.num_experts
-        # MoE expert rules MUST come before dense MLP rules because
-        # the dense ".gate_proj" suffix would also match the remapped
-        # MoE key "experts.gate_proj.__expertN__.weight". _apply_stacked
-        # returns on first match, so longer/more-specific rules go first.
-        rules = []
-        for i in range(E):
-            # source_suffix includes ".weight" so the replacement strips it —
-            # the target params (experts.gate_up_proj, experts.down_proj) are
-            # bare nn.Parameters, not Linear submodules, so they have no
-            # ".weight" suffix in named_parameters().
-            rules.append(StackedParamRule(
-                target_suffix=".experts.gate_up_proj",
-                source_suffix=f".experts.gate_proj.__expert{i}__.weight",
-                shard_id=f"gate:{i}",
-            ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.gate_up_proj",
-                source_suffix=f".experts.up_proj.__expert{i}__.weight",
-                shard_id=f"up:{i}",
-            ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.down_proj",
-                source_suffix=f".experts.down_proj.__expert{i}__.weight",
-                shard_id=f"down:{i}",
-            ))
-        # Dense MLP gate/up fusion and attention qkv fusion.
-        rules.append(StackedParamRule(".gate_up_proj", ".gate_proj", 0))
-        rules.append(StackedParamRule(".gate_up_proj", ".up_proj", 1))
-        rules.append(StackedParamRule(".qkv_proj", ".q_proj", "q"))
-        rules.append(StackedParamRule(".qkv_proj", ".k_proj", "k"))
-        rules.append(StackedParamRule(".qkv_proj", ".v_proj", "v"))
-        self._THINKER_STACKED_PARAMS = rules
-        return rules
+        from mstar.model.qwen3_omni.reference import stacked_parameter_rules
+        return stacked_parameter_rules(self.config.thinker_text.num_experts)
 
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
         moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule:
+        from mstar.model.components.moe import prepare_moe_weights
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
@@ -1544,6 +1606,7 @@ class Qwen3OmniModel(Model):
             stacked_params=self._get_thinker_stacked_params(),
             name_remapper=self._thinker_remap,
         )
+        prepare_moe_weights(thinker_model)
         thinker_model.eval()
 
 
@@ -1557,88 +1620,15 @@ class Qwen3OmniModel(Model):
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule:
-        from mstar.model.loader import load_hf_weights
-        from mstar.model.loader.iterators import iter_safetensors_shards
-        from mstar.model.qwen3_omni.components.talker import (
-            Qwen3OmniTalkerModel,
+        from mstar.model.qwen3_omni.reference import build_talker_program
+        from mstar.model.qwen3_omni.submodules import LegacyTalkerSubmodule
+        program = build_talker_program(
+            self, device=torch.device(device), dtype=autocast_dtype or torch.float32,
+            tp_group=tp_group,
         )
-
-        with torch.device("meta"):
-            # ``tp_group`` shards the Talker LLM's attention + MoE. The
-            # CodePredictor stays TP=1 (separate construction below) —
-            # its compute is small and the deterministic FlashInfer sampler
-            # produces bit-equal codes on every rank, so per-rank
-            # replication is cheaper than 150+ NCCL all-reduces per
-            # decode step (5 layers x 15 unrolled iterations).
-            talker_model = Qwen3OmniTalkerModel(self.config, comm_group=tp_group)
-        # Cast on meta (no allocation) so to_empty allocates directly in the
-        # target dtype instead of fp32-then-downcast.
-        if autocast_dtype is not None:
-            talker_model = talker_model.to(autocast_dtype)
-        talker_model.to_empty(device=device)
-
-        # Talker and CodePredictor share the "talker." prefix. We stream
-        # once and split: code_predictor keys go to the CodePredictor,
-        # everything else goes to the TalkerModel.
-        talker_weights = []
-        code_pred_weights = []
-        _CP_PREFIX = "talker.code_predictor."
-        _TALKER_PREFIX = "talker."
-
-        initialized_thinker_embed_tokens = False
-        text_config = self.config.thinker_text
-        embed_tokens = torch.nn.Embedding(
-            text_config.vocab_size, text_config.hidden_size,
-            device=device
-        ).eval()
-        for k, v in iter_safetensors_shards(self.local_dir, device=device, prefix=_TALKER_PREFIX):
-            if k.startswith(_CP_PREFIX):
-                code_pred_weights.append((k.removeprefix(_CP_PREFIX), v))
-            else:
-                talker_weights.append((k.removeprefix(_TALKER_PREFIX), v))
-        for _k, v in iter_safetensors_shards(
-            self.local_dir, device=device, prefix="thinker.model.embed_tokens"
-        ):
-            initialized_thinker_embed_tokens = True
-            with torch.no_grad():
-                embed_tokens.weight.copy_(v)
-
-        assert initialized_thinker_embed_tokens, \
-            "thinker.model.embed_tokens not found to initialize talker TTS embeds"
-
-        stacked = self._get_thinker_stacked_params()
-        load_hf_weights(
-            talker_model, iter(talker_weights),
-            stacked_params=stacked,
-            name_remapper=self._thinker_remap,
-        )
-        talker_model.eval()
-
-        with torch.device("meta"):
-            code_predictor = Qwen3OmniCodePredictor(self.config)
-        # Cast on meta (no allocation) so to_empty allocates directly in the
-        # target dtype instead of fp32-then-downcast.
-        if autocast_dtype is not None:
-            code_predictor = code_predictor.to(autocast_dtype)
-        code_predictor.to_empty(device=device)
-        load_hf_weights(
-            code_predictor, iter(code_pred_weights),
-            stacked_params=stacked,
-            name_remapper=self._thinker_remap,
-        )
-        code_predictor.consolidate_stacked_weights()
-        code_predictor.eval()
-
-        from mstar.model.qwen3_omni.submodules import TalkerSubmodule
-        talker_sub = TalkerSubmodule(
-            talker_model=talker_model,
-            code_predictor=code_predictor,
-            config=self.config,
-        )
-        talker_sub.init_tts_embeds(embed_tokens)
-        del embed_tokens
-
-        return talker_sub
+        submodule = LegacyTalkerSubmodule(program.model, program.code_predictor, self.config)
+        submodule._init_tts_raw_embeddings(program.tts_embeddings)
+        return submodule
 
     def _create_code2wav_submodule(self, device: str) -> NodeSubmodule:
         # Code2Wav is the vocoder that converts codec tokens to audio waveform.
@@ -1673,10 +1663,9 @@ class Qwen3OmniModel(Model):
         """Load the audio encoder (AuT) from HF weights."""
         # Reuse HF audio encoder directly (Whisper-style, not perf-critical)
         from transformers import AutoConfig
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeAudioEncoder,
-        )
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 
+        from mstar.model.components.hf_attention import build_hf_encoder
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
@@ -1690,15 +1679,13 @@ class Qwen3OmniModel(Model):
         audio_config = config.thinker_config.audio_config
 
         # Build the audio encoder from config.
-        # IMPORTANT: pass attn_implementation="flash_attention_2" so the
-        # encoder uses the cu_seqlens FA2 path. With the HF default
-        # (which resolves to "sdpa"), Qwen3OmniMoeAudioAttention runs
-        # SDPA on the full packed sequence (no per-segment fusion),
-        # which is significantly slower than FA2's varlen path.
+        # IMPORTANT: the encoder must get a varlen attention implementation
+        # (FA2, or mstar's varlen kernel where flash_attn is not installed)
+        # so it uses the cu_seqlens path. With the HF default (which resolves
+        # to "sdpa"), Qwen3OmniMoeAudioAttention runs SDPA once per window,
+        # which is significantly slower than the varlen path.
         patch_hf_fa2_int_maxlen()
-        audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
-            audio_config, attn_implementation="flash_attention_2"
-        )
+        audio_encoder = build_hf_encoder(Qwen3OmniMoeAudioEncoder, audio_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
@@ -1718,6 +1705,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeVisionEncoder,
         )
 
+        from mstar.model.components.hf_attention import build_hf_encoder
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
@@ -1731,19 +1719,18 @@ class Qwen3OmniModel(Model):
         vision_config = config.thinker_config.vision_config
 
         # Build the vision encoder.
-        # CRITICAL: pass attn_implementation="flash_attention_2". Without
-        # this, vision_config._attn_implementation defaults to None and is
+        # CRITICAL: give it a varlen attention implementation (FA2, or
+        # mstar's varlen kernel where flash_attn is not installed). Without
+        # one, vision_config._attn_implementation defaults to None and is
         # resolved to "sdpa" at runtime (modeling_utils.py:1889). With
         # "sdpa", Qwen3OmniMoeVisionAttention.forward falls into the
         # per-segment Python loop (modeling_qwen3_omni_moe.py:892-913),
         # which issues N sequential attention calls per layer for an
-        # N-frame video and makes V2T/V2S TTFT far slower. With
-        # "flash_attention_2", a single varlen FA2 call
-        # per layer handles all frames at once via cu_seqlens.
+        # N-frame video and makes V2T/V2S TTFT far slower. With a varlen
+        # implementation, a single call per layer handles all frames at once
+        # via cu_seqlens.
         patch_hf_fa2_int_maxlen()
-        vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
-            vision_config, attn_implementation="flash_attention_2"
-        )
+        vision_encoder = build_hf_encoder(Qwen3OmniMoeVisionEncoder, vision_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
