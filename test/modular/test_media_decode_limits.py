@@ -635,3 +635,52 @@ def test_a_16_bit_png_reads_as_uint8(tmp_path, color_type, channels):
         assert torch.equal(image, torch.from_numpy(np.asarray(Image.open(path).convert("RGB"))).permute(2, 0, 1))
     loaded = Model.load_image(None, path, "cpu").data
     assert 0.0 <= loaded.min() and loaded.max() <= 1.0
+
+
+@pytest.mark.parametrize("suffix", ["mp4", "mkv"])
+@pytest.mark.parametrize("side", [64, 16])
+def test_qwen3_omni_pyav_sampling_stops_before_retaining_over_budget(tmp_path, monkeypatch, suffix, side):
+    """The ROCm reader retains only its sampled frames, including when it
+    counts packets because the container header has no frame count."""
+    vision_process = pytest.importorskip("qwen_omni_utils.v2_5.vision_process")
+
+    from mstar.model.components import media_io
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    # Use the installed qwen-utils API and the real PyAV decoder on every host.
+    assert callable(vision_process.calculate_video_frame_range)
+    decoder = media_io._PyAVVideo()
+    monkeypatch.setattr(media_io, "_decoders", lambda: types.SimpleNamespace(video=decoder))
+    path = _mp4(tmp_path / f"clip.{suffix}", frames=10, side=side)
+    if suffix == "mkv":
+        assert probe_video(path) is None
+
+    retained = []
+    frame_tensor = media_io._frame_tensor
+
+    def retain(frame):
+        retained.append((frame.height, frame.width))
+        return frame_tensor(frame)
+
+    monkeypatch.setattr(media_io, "_frame_tensor", retain)
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(MIN_FRAME_PIXELS * 3))
+    with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
+        Qwen3OmniModel.load_video(None, path, "cpu")
+    assert retained == [(side, side)] * 3
+
+    retained.clear()
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(MIN_FRAME_PIXELS * 4))
+    video = Qwen3OmniModel.load_video(None, path, "cpu")
+    assert video.data.shape[0] == 4 and torch.isfinite(video.data).all()
+    assert retained == [(side, side)] * 4
+
+    retained.clear()
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(MIN_FRAME_PIXELS * 5))
+    budget = RequestMediaBudget(num_files=2)
+    with budget.file():
+        Qwen3OmniModel.load_video(None, path, "cpu")
+    assert budget.used["video"] == MIN_FRAME_PIXELS * 4
+    with budget.file(), pytest.raises(ValueError, match="videos decode to more than .* together"):
+        Qwen3OmniModel.load_video(None, path, "cpu")
+    assert retained == [(side, side)] * 5
+
