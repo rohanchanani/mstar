@@ -68,6 +68,7 @@ def test_an_unbatched_step_clears_rows_only(rids):
     eng._device = SimpleNamespace(type="cpu")
     eng._autocast_dtype_for = lambda sub: None
     eng.reserve_replay_slot = lambda batch: None
+    eng._reserve_execution = lambda batch: True
     seen = {}
 
     def _per_request(batch):
@@ -81,7 +82,7 @@ def test_an_unbatched_step_clears_rows_only(rids):
         step_context=SimpleNamespace(slot_lease=None, graph_walk="decode"),
         exec_timings=SimpleNamespace(start=None), admit_error=None,
         outputs_ready=threading.Event(), release_waiters=lambda: None,
-        preplanned_rids=None, preplan_event=None,
+        preplanned_rids=None, preplan_event=None, selected_execution=None,
     )
     eng.exec(batch)
     assert seen["rows_only"] is False and batch.rows_only is False

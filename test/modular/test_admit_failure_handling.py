@@ -618,6 +618,7 @@ class _FakeMgmt:
 
     def __init__(self, submodule, num_slots: int, next_slot: int, seen: list):
         self.submodule = submodule
+        self.tensor_program = None
         self.num_slots = num_slots
         self.needs_slot_fence = False
         self._next_slot = next_slot
@@ -640,6 +641,7 @@ class _FakeExecEngine:
     """Engine internals bound onto stubs, to drive `_exec_per_request` alone."""
 
     _exec_per_request = Engine._exec_per_request
+    _exec_per_request_steps = Engine._exec_per_request_steps
     _declare_and_admit = Engine._declare_and_admit
 
     def __init__(
@@ -686,7 +688,7 @@ class _FakeExecEngine:
     # --- engine internals the path calls into
     def _drive_step(
         self, batch, submodule_mgmt, request_ids, inputs, req_info, ctx,
-        lease, running_batched, step, set_launch,
+        lease, running_batched, step, set_launch, selected=None,
     ):
         del batch, submodule_mgmt, inputs, req_info, lease, running_batched
         rid = request_ids[0]
