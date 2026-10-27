@@ -233,4 +233,5 @@ class TalkerSubmodule(ARNodeSubmodule):
                   "codec_tokens": [result.codec_tokens[i]],
                   "new_token": [result.tokens[i]]}
             for i, rid in enumerate(invocation.request_ids)
-        }))
+        }, check_stop_buffers={"layer0_codes": result.tokens},
+            row_request_ids=tuple(invocation.request_ids)))

@@ -629,3 +629,29 @@ def test_greedy_talker_matches_independent_logical_weight_oracle(prepared_talker
     assert oracle.requests == {}
     resources[TALKER_KV].assert_pages_conserved()
     resources[TALKER_KV].cleanup()
+
+
+def test_talker_stop_rows_preserve_request_mapping_and_stop_decisions(tiny_checkpoint):
+    from mstar.model.qwen3_omni.results import TalkerResult
+    from mstar.worker.worker import Worker
+
+    shell = Qwen3OmniModel.describe(model_path_hf=str(tiny_checkpoint[0])).create_submodule("Talker")
+    rids = (71, 19, 42)
+    eos = shell.config.talker.codec_eos_token_id
+    tokens = torch.tensor([eos, 0, 0])
+    result = TalkerResult(torch.zeros(3, shell.num_codes, dtype=torch.long),
+                         torch.zeros(3, shell.cp_cfg.hidden_size), tokens)
+    invocation = SimpleNamespace(graph_walk="talker_decode", request_ids=rids)
+    output = shell.execution_result(result, invocation).outputs
+    assert output.row_request_ids == rids
+    assert output.check_stop_buffers == {"layer0_codes": tokens}
+    host = Worker._rows_to_per_rid(output.check_stop_buffers, list(rids))
+    for i, rid in enumerate(rids):
+        info = SimpleNamespace(step_metadata={}, max_tokens=4,
+                               dynamic_loop_iter_counts={"talker_decode_loop": 3 if i == 2 else 0})
+        legacy = dict(output.per_rid_outputs[rid])
+        shell.postprocess(rid, info, legacy)
+        assert torch.equal(legacy["layer0_codes"][0], host[rid]["layer0_codes"][0].squeeze(0))
+        expected = {"talker_decode_loop"} if i in (0, 2) else set()
+        assert shell.check_stop(rid, info, legacy) == expected
+        assert shell.check_stop(rid, info, host[rid]) == expected
