@@ -1589,3 +1589,29 @@ def test_a_mixing_yield_away_skips_the_whole_combined_walk():
 def test_a_bad_mixing_setting_is_refused(mixes, error):
     with pytest.raises(ValueError, match=error):
         _combined_scheduler(_Engine(max_bs=8), mixes)
+
+
+def test_bound_candidate_window_never_selects_unchecked_rows_and_advances():
+    from mstar.engine.execution import ExecutionCapabilities, ExecutionOption, Support
+
+    engine = _Engine(max_bs=1)
+
+    def supports(facts):
+        row, = facts.resource_facts["policy"]
+        assert row["rid"] in engine.checked
+        return Support.YES if row["rid"] == "r17" else Support.NO
+
+    caps = ExecutionCapabilities((ExecutionOption(
+        "one", supports, lambda facts: None, lambda *args: None, lambda *args: None,
+    ),), {WALK: 1})
+    engine.execution_capabilities = lambda _: caps
+    engine.resource_facts = lambda node, rids: {"policy": tuple({"rid": rid} for rid in rids)}
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"r{i}" for i in range(20)])
+    manager = _Manager([])
+    assert _next_batch(sched, manager) is None
+    assert "r17" not in engine.checked
+    assert len(sched.backlog[(NODE, WALK)]) == 20
+    batch = _next_batch(sched, manager)
+    assert list(batch.request_to_worker_graph) == ["r17"]
+    assert len(sched.backlog[(NODE, WALK)]) == 19

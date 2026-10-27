@@ -24,6 +24,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
+
+from mstar.engine.execution import UnsupportedInvocation
+
 from api_server_helpers import make_test_api_server
 
 from mstar.api_server.entrypoint import PendingRequest
@@ -359,3 +363,33 @@ def test_result_transfer_failure_answers_for_every_queued_tensor():
         )
     assert wt.out_queue.qsize() == 2
     assert b"arena full" in wt.out_queue.get_nowait().data
+
+
+@pytest.mark.parametrize("error_type,expected_status", [
+    (UnsupportedInvocation, 400), (ValueError, 500), (RuntimeError, 500),
+])
+def test_ingest_policy_rejection_preserves_its_client_error_status(error_type, expected_status):
+    w = _worker(known_rids=("r1",))
+    w._draining_rids = set()
+    w._last_active = {}
+    w._graph_runtime.add_request = lambda **kwargs: "r1"
+    w._graph_runtime.get_sharding_config = lambda rid: object()
+    w.request_state.add_request = lambda *args: None
+    w.tensor_manager = SimpleNamespace(register_request=lambda *args: None)
+    processed = []
+    w._process_unprocessed = processed.append
+
+    def reject(*args):
+        raise error_type("request policy is unsupported")
+
+    w.engine_manager = SimpleNamespace(evictable_nodes=lambda: (), add_request=reject)
+    body = SimpleNamespace(
+        request_id="r1", partition_worker_graph_ids=[0], worker_graph_to_workers={0: ["w0"]},
+        loop_caps={},
+        request_info=SimpleNamespace(partition_name="default", graph_walk="prefill", rid_handle=-1, resource_configs={}),
+    )
+    w._add_new_request(body)
+    assert len(w.sent) == 1
+    assert w.sent[0][1].body.status == expected_status
+    assert w.scheduler.failed_rids == {"r1"}
+    assert processed == ["r1"]

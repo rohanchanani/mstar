@@ -373,3 +373,19 @@ def test_stale_early_entries_are_swept():
     assert not c._early_abort_requests
     assert not c._early_reads_done_deadlines
     assert not c._early_abort_deadlines
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_worker_failure_status_is_published_only_after_readers_drain(status):
+    c = _conductor({"r1": _request_data()})
+    c._fail_requests(FailRequests(errors={"r1": "policy or execution failed"}, status=status))
+    assert _drain_targets(c, "r1") == {"w0", PREPROCESS}
+    assert not [m for entity, m in c.sent if entity == "api_server"]
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id="w0"))
+    assert not [m for entity, m in c.sent if entity == "api_server"]
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    failures = [m.body for entity, m in c.sent if entity == "api_server"]
+    assert len(failures) == 1
+    assert failures[0].status == status
+    assert failures[0].error_message == "policy or execution failed"
+    assert _remove_targets(c, "r1") == {"w0", PREPROCESS}

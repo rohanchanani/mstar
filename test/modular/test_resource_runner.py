@@ -611,3 +611,22 @@ def test_a_refused_pre_admit_gives_back_what_it_reserved():
 
     assert kv.calls.count("rollback") == 1
     assert attn.calls.count("rollback") == 1, "the refusing resource too"
+
+
+def test_refused_staged_step_must_reserve_again_before_retry():
+    kv = _Stub("kv", preplans=True)
+    admission = _Stub("admission", deps=("kv",))
+    runner = StepRunner({"kv": kv, "admission": admission})
+    step = _step(["kv", "admission"])
+    step.ctx.is_preplan = True
+    assert runner.pre_admit(step).ok
+    runner.pre_plan(step)
+    step.ctx.is_preplan = False
+    admission._admit_outcome = AdmitOutcome(ok=False, reason=AllocationFailed(
+        message="busy", pages_short=1, label="main", request_id="r1",
+    ))
+    assert not runner.admit(step).ok
+    assert not runner.staged
+    admission._admit_outcome = None
+    assert runner.admit(step).ok
+    assert kv.calls.count("admit") == 2

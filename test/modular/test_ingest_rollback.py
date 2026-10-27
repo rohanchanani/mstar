@@ -60,7 +60,13 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
         register_request=lambda rid, sharding: registered.append(rid),
         start_read_tensors=lambda *a, **kw: pytest.fail("no reads for a failed request"),
     )
-    w._fail_requests = failed.append
+    failure_statuses = []
+
+    def fail_requests(errors, *, status=500):
+        failed.append(errors)
+        failure_statuses.append(status)
+
+    w._fail_requests = fail_requests
     w._process_message_list = processed.extend
     body = SimpleNamespace(
         request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
@@ -71,5 +77,6 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     Worker._add_new_request(w, body)
     assert registered == [5] and len(failed) == 1 and list(failed[0]) == [5]
     assert "over capacity" in failed[0][5]
+    assert failure_statuses == [500]
     # messages parked before the NEW still go through (a parked REMOVE among them)
     assert processed == ["parked"] and "wire" not in w._unprocessed_messages
