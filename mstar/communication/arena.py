@@ -58,6 +58,7 @@ from mstar.communication.tensors import (
     _serialize_tensor,
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.platforms import current_platform
 from mstar.utils.containers import ParallelList
 
 logger = logging.getLogger(__name__)
@@ -156,10 +157,11 @@ def _unlink_paths(paths: list) -> None:
 
 
 def _unpin(ptr: int) -> bool:
-    """cudaHostUnregister a previously pinned mapping (GIL released via
-    ctypes). Returns success."""
+    """Unregister a previously pinned mapping using its device runtime."""
     if not torch.cuda.is_available():
         return False
+    if current_platform.is_rocm():
+        return torch.cuda.cudart().cudaHostUnregister(ptr) == 0
     try:
         lib = _cudart()
     except OSError:
@@ -192,19 +194,22 @@ def _unpin_live(own_pinned: list, peers: dict) -> None:
 
 def _pin(ptr: int, nbytes: int) -> bool:
     """cudaHostRegister a mapped segment (idempotent). Returns success.
-    GIL released for the duration (see ``_cudart``)."""
+    CUDA releases the GIL via ctypes; ROCm uses torch's HIP-backed binding."""
     if not torch.cuda.is_available():
         return False
-    try:
-        lib = _cudart()
-    except OSError as e:
-        logger.warning("ARENA: cannot load libcudart (%s); copies fall back "
-                       "to pageable bandwidth", e)
-        return False
-    rc = lib.cudaHostRegister(ptr, nbytes, 0)
-    if rc != 0:
-        # Set by an already-registered range (accepted below) too.
-        lib.cudaGetLastError()
+    if current_platform.is_rocm():
+        rc = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)
+    else:
+        try:
+            lib = _cudart()
+        except OSError as e:
+            logger.warning("ARENA: cannot load libcudart (%s); copies fall back "
+                           "to pageable bandwidth", e)
+            return False
+        rc = lib.cudaHostRegister(ptr, nbytes, 0)
+        if rc != 0:
+            # Set by an already-registered range (accepted below) too.
+            lib.cudaGetLastError()
     ok = rc in (0, _CUDA_HOST_ALREADY_REGISTERED)
     if not ok:
         logger.warning("cudaHostRegister(%#x, %d) failed rc=%d — copies fall "
