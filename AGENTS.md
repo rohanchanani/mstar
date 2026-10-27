@@ -8,6 +8,18 @@ When explaining a correctness or performance result (in a PR description, a revi
 
 If a hang, crash, or other bug has several plausible causes, the tempting fix is to add a mechanism per cause. Every mechanism must satisfy the invariants if possible, and must be logically defensible. If a mechanism doesn't work, cannot be reasoned to be independently correct, or breaks an invariant, then it should be removed. Especially in tricky concurrency-sensitive places like TP lockstep, high-level reasoning can go a longer way than trying out several plausible fixes. Don't add a second mechanism while the first is unproven.
 
+## Ownership boundaries govern debugging and fixes
+
+M* components have explicit responsibilities and contracts. Debugging must identify which component is failing to fulfill its responsibility. **Only fix components that violate their own contract. A component that fulfills its contract must not be changed to compensate for another component's defect, even if that change makes the failing test pass.** Passing a test does not justify moving responsibility across a boundary.
+
+Before proposing a fix, state the relevant contract, its owner, and the evidence of the violation. Trace valid inputs and required outputs/state across boundaries until the failing owner is identified. Distinguish the component that exposes a defect from the component responsible for it. A difference from a reference implementation is evidence to investigate, not itself a contract violation or a reason to copy the reference's behavior.
+
+The scheduler owns selecting and grouping requests within the advertised execution capabilities and scheduling constraints. If it selects a supported batch, it is fulfilling its duty. Execution owns correctly implementing that supported invocation, including eager/captured equivalence under the same declared semantics. A valid scheduler decision that exposes an eager/captured discrepancy is not a scheduler bug. Locate the violated execution, resource, or kernel contract and repair its owner; do not change the scheduler, batch limits, or capability declarations merely to avoid the failing execution path.
+
+Controlled interventions may change grouping, force a path, or substitute an input to isolate a cause. Such interventions are diagnostic experiments, not acceptable fixes to compliant components. Do not promote them into production workarounds, weaken the test, alter valid inputs, or narrow supported behavior to hide the violation. Validate the actual repair against the original supported failing case and the existing contract.
+
+If ownership or the contract is uncertain, resolve that uncertainty from the architecture, interfaces, and evidence before changing behavior. Do not invent a new contract to justify a patch. Any proposed change to responsibilities or supported semantics is a separate design decision, not a debugging fix.
+
 ## Layer map
 
 | Layer | Path | Owns |
@@ -263,3 +275,13 @@ Not rules, and the reviewer shouldn't cite them. These paid off for Qwen3.5 agai
 - **Under TP, fuse all-reduce, residual add and norm** (FlashInfer's one-shot kernel) rather than NCCL followed by a separate norm: +10-15% at 9B TP2.
 - **Cap torch's intra-op threads for CPU work in the API server** such as image preprocessing. The default pool stalled about one preprocess in eight by 35-130 ms on a shared host.
 - **Capture launch-bound encoders.** An eager ViT tower was ~4 ms of GPU work in a ~20 ms forward; a piecewise capture of its block loop (`PiecewisePackedConfig`) brought `image_to_text` level with vLLM.
+
+## Investigations must overlap execution with reasoning
+
+During debugging and root-cause investigations, launch measurements and tests asynchronously by default. Keep their process/job identity, logs and exit status so they can be checked without blocking ongoing analysis. The objective is the shortest time to an evidenced cause and correct repair, not the largest number of test runs.
+
+Before launching a run, state the concrete unanswered question, the relevant owner/contract, what each plausible outcome would imply, and why existing results or source inspection cannot answer it. Choose the cheapest discriminating experiment; reuse saved inputs, outputs and loaded processes. Do not rerun a whole suite to answer a local question.
+
+While a job runs, continue tracing the relevant source and assessing results already available. Assess partial and completed results immediately, even if other jobs are still running; update the hypothesis and next action from that evidence. Do not make launch-wait-poll the investigation workflow, and do not treat a running test as permission to stop thinking. Do not launch additional tests merely to appear busy. Only wait when useful independent analysis is exhausted and a specific pending result genuinely blocks the next decision.
+
+Keep reference validity, migration preservation, numerical agreement and application quality as separate claims. Do not search for an oracle or adjust acceptance until the candidate passes. A harness correction needs an independently demonstrated defect and a separately justified central policy change; retain the old failures and state the limits of the new evidence.

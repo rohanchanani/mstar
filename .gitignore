@@ -36,3 +36,8 @@ CLAUDE.md
 
 # Optional local CI reports
 .ci-results/
+
+# Logical model fixtures and deployment quality anchors are source data.
+!test/fixtures/qwen3_omni/config.json
+!test/fixtures/qwen3_omni/checkpoint_metadata.json
+!mstar/model/whisper/public_q8_quality.json
