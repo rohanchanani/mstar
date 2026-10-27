@@ -77,6 +77,16 @@ class KVConfig(ABC):
 
 
 @dataclass(kw_only=True)
+class SequenceKVConfig(KVConfig):
+    """Logical append-only sequence storage, before deployment resolution."""
+
+    max_seq_len: int
+
+    def apply_yaml_overrides(self, **kwargs) -> None:
+        raise TypeError("resolve logical KV storage through apply_yaml_overrides(specs, deployment)")
+
+
+@dataclass(kw_only=True)
 class PagedKVConfig(KVConfig):
     """Fixed-size pages, appended to as a sequence grows. The default."""
 
@@ -292,7 +302,7 @@ class KVReqConfig(ResourceReqConfig):
             }
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
-        if spec is None or not isinstance(spec.config, PagedKVConfig):
+        if spec is None or not isinstance(spec.config, (PagedKVConfig, SequenceKVConfig)):
             return {}
         caps, room = self.loop_caps or {}, {}
         for layout in (self.kv_layout or {}).values():
@@ -307,7 +317,7 @@ class KVReqConfig(ResourceReqConfig):
         """``ValueError`` (a 400) when a label would hold more positions at the request's caps
         than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
         the one model that declares one, computes its positions in each forward."""
-        if spec is None or not isinstance(spec.config, PagedKVConfig):
+        if spec is None or not isinstance(spec.config, (PagedKVConfig, SequenceKVConfig)):
             return
         for label, layout in (self.kv_layout or {}).items():
             positions = layout.positions(self.loop_caps or {})

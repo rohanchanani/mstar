@@ -20,7 +20,7 @@ from mstar.api_server.request_types import PreprocessInput
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, SequenceKVConfig, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
@@ -59,12 +59,14 @@ class _ScriptDoneError(Exception):
 
 class _Model(Model):
 
-    def __init__(self, layout=LAYOUT, max_seq_len=4096):
+    def __init__(self, layout=LAYOUT, max_seq_len=4096, config_type=PagedKVConfig):
         self._layout, self._max_seq_len = layout, max_seq_len
+        self._config_type = config_type
 
     def get_node_resources(self):
-        return [KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=self._max_seq_len, max_num_pages=64, page_size=PS,
+        physical = {"max_num_pages": 64, "page_size": PS} if self._config_type is PagedKVConfig else {}
+        return [KVSpec(resource_key="kv", nodes={"llm"}, config=self._config_type(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=self._max_seq_len, **physical,
         ))]
 
     def kv_labels(self):
@@ -123,7 +125,8 @@ def _preprocess(model: _Model, model_kwargs: dict) -> dict:
     worker = PreprocessWorkerThread(
         *(queue.Queue() for _ in range(8)), stop_event=threading.Event(), communicator=_Comm(),
         tensor_manager=_StubTensorManager(), model=model,
-        model_config={"model": "stub", "resources": {"kv": {"page_size": PS}}},
+        model_config={"model": "stub", "resources": {"kv": {"page_size": PS}}
+                      if model._config_type is PagedKVConfig else {}},
     )
     worker._process_input(PreprocessInput(
         request_id="r", text="hello", file_paths=None, input_modalities=["text"],
@@ -199,9 +202,10 @@ def test_a_cap_past_its_loop_is_refused(tmp_path, monkeypatch):
     assert not any(getattr(msg.message_type, "name", "") == "NEW_REQUEST" for msg in sent)
 
 
+@pytest.mark.parametrize("config_type", [PagedKVConfig, SequenceKVConfig])
 @pytest.mark.parametrize("context, model_kwargs", [(PROMPT + 29, {"max_output_tokens": 30}), (PROMPT - 1, {})])
-def test_a_request_past_the_context_is_refused(tmp_path, monkeypatch, context, model_kwargs):
-    model = _Model(max_seq_len=context)
+def test_a_request_past_the_context_is_refused(tmp_path, monkeypatch, context, model_kwargs, config_type):
+    model = _Model(max_seq_len=context, config_type=config_type)
 
     sent = _conduct(model, _preprocess(model, model_kwargs), tmp_path, monkeypatch).sent
 
@@ -209,19 +213,21 @@ def test_a_request_past_the_context_is_refused(tmp_path, monkeypatch, context, m
     assert [body.status for body in failed] == [400], "a request past the model's context was served"
 
 
-def test_a_span_counts_its_advance_not_its_slots_against_the_context():
+@pytest.mark.parametrize("config_type", [PagedKVConfig, SequenceKVConfig])
+def test_a_span_counts_its_advance_not_its_slots_against_the_context(config_type):
     cfg = KVReqConfig(
         kv_layout={"main": StreamLayout(spans=(PrefixSpan(100, 40, "prefill"),), growth=(("decode_loop", 1),))},
         loop_caps={"decode_loop": 50},
     )
 
-    cfg.validate(_Model(max_seq_len=90).get_node_resources()[0])
+    cfg.validate(_Model(max_seq_len=90, config_type=config_type).get_node_resources()[0])
     with pytest.raises(ValueError, match="past the model's context"):
-        cfg.validate(_Model(max_seq_len=89).get_node_resources()[0])
+        cfg.validate(_Model(max_seq_len=89, config_type=config_type).get_node_resources()[0])
 
 
-def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypatch):
-    model = _Model(max_seq_len=PROMPT + 29)
+@pytest.mark.parametrize("config_type", [PagedKVConfig, SequenceKVConfig])
+def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypatch, config_type):
+    model = _Model(max_seq_len=PROMPT + 29, config_type=config_type)
 
     new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch)
 
