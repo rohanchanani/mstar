@@ -1456,31 +1456,38 @@ class Engine:
         slot = batch.slot or 0
         steps: dict[str, SubmoduleStep] = {}
         ctxs: dict[str, StepContext] = {}
-        for i, (rid, inp) in enumerate(
-            zip(batch.request_ids, batch.inputs, strict=True)
-        ):
-            ctxs[rid] = StepContext(
-                request_ids=(rid,),
-                graph_walk=batch.step_context.graph_walk,
-                slot=slot, capture=False,
-            )
-            if i != len(batch.request_ids) - 1:
-                slot = submodule_mgmt.lease_slot()
-            # declare (here) and drive (below) are separate loops, so the
-            # region runners are pointed at the slot in both
-            submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
-            admit_outcome, steps[rid] = self._declare_and_admit(
-                batch, rids=[rid], inputs=[inp],
-                submodule=submodule_mgmt.submodule,
-                ctx=ctxs[rid], nvtx=nvtx
-            )
-            if not admit_outcome.ok:
-                # all or nothing, as a batched step's admit is: the requests
-                # admitted ahead of this one will not run either
-                for earlier in reversed(batch.request_ids[:i]):
-                    if steps[earlier] is not None:
-                        self._runner.rollback_admit(steps[earlier])
-                return merged
+        admitted: list[SubmoduleStep] = []
+        all_admitted = False
+        try:
+            for i, (rid, inp) in enumerate(
+                zip(batch.request_ids, batch.inputs, strict=True)
+            ):
+                ctxs[rid] = StepContext(
+                    request_ids=(rid,),
+                    graph_walk=batch.step_context.graph_walk,
+                    slot=slot, capture=False,
+                )
+                if i != len(batch.request_ids) - 1:
+                    slot = submodule_mgmt.lease_slot()
+                # declare (here) and drive (below) are separate loops, so the
+                # region runners are pointed at the slot in both
+                submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
+                admit_outcome, steps[rid] = self._declare_and_admit(
+                    batch, rids=[rid], inputs=[inp],
+                    submodule=submodule_mgmt.submodule,
+                    ctx=ctxs[rid], nvtx=nvtx
+                )
+                if not admit_outcome.ok:
+                    return merged
+                if steps[rid] is not None:
+                    admitted.append(steps[rid])
+            all_admitted = True
+        finally:
+            if not all_admitted:
+                # No forward ran: refusal or a preflight exception cancels
+                # every earlier reservation, in reverse admission order.
+                for step in reversed(admitted):
+                    self._runner.rollback_admit(step)
 
         # Step 2: drive step, plan -> forward -> commit loop.
         # Nothing stages before here, so only this loop fences, in two places:
