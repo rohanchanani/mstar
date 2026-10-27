@@ -67,6 +67,7 @@ def instantiate_moe_block(
     router: nn.Module | None = None,
     comm_group: CommGroup | None = None,
     moe_parallel: MoeParallelConfig | None = None,
+    moe_backend: str | None = None,
 ) -> ParallelSparseMoeBlock | ExpertParallelSparseMoeBlock:
     """The routed-expert block ``moe_parallel`` asks for; TP when None.
 
@@ -74,7 +75,7 @@ def instantiate_moe_block(
     """
     moe_parallel = moe_parallel or MoeParallelConfig()
     if moe_parallel.parallel == "tp":
-        return ParallelSparseMoeBlock(
+        block = ParallelSparseMoeBlock(
             hidden_size=hidden_size,
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
@@ -82,7 +83,14 @@ def instantiate_moe_block(
             norm_topk_prob=norm_topk_prob,
             router=router,
             comm_group=comm_group,
+            moe_backend=moe_backend,
         )
+        backend = block.experts_backend
+        if moe_parallel.mask_padding and backend is not None and not backend.supports_invalid_experts:
+            raise ValueError(f"MoE backend {moe_backend!r} does not support mask_padding")
+        return block
+    if moe_backend not in (None, "auto", "triton"):
+        raise ValueError("Upstream expert-parallel dispatch requires the Triton backend")
     ep_group = moe_parallel.resolve_ep_group(comm_group)
     return ExpertParallelSparseMoeBlock(
         hidden_size=hidden_size,
