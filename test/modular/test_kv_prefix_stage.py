@@ -58,6 +58,8 @@ class _Answering(Resource):
 
 
 class _Submodule:
+    execution_capabilities = None
+
     """Cuts the way a real AR submodule does, without being a torch module."""
 
     def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
@@ -313,7 +315,7 @@ class _Preparing(_Submodule):
 
 def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
     engine = _engine({"kv": _RaisingFor(96, RID)}, {NODE: ["kv"]})
-    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={}, physical=None, tensor_program=None)
     batch = ExecutingBatch(
         node_name=NODE, per_request_info={RID: None, "r1": None},
         step_context=StepContext(
@@ -338,7 +340,7 @@ def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
 @pytest.mark.parametrize("request_walks", [{}, {RID: WALK, "r1": "decode"}], ids=["one walk", "mixed"])
 def test_a_walk_the_cache_serves_whole_completes_without_failing_its_request(request_walks):
     engine = _engine({"kv": _Answering(PROMPT)}, {NODE: ["kv"]})
-    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={}, physical=None, tensor_program=None)
     batch = ExecutingBatch(
         node_name=NODE, per_request_info={RID: None, "r1": None},
         step_context=StepContext(

@@ -34,6 +34,7 @@ def test_resource_owns_kernel_capture_support(device_type):
             resource._device = torch.device(device_type)
             assert resource.can_capture()
     sampler = object.__new__(SamplerResource)
+    sampler._planned = False
     sampler._device = torch.device(device_type)
     assert sampler.can_capture() is (device_type != "cpu")
     assert not object.__new__(DenseAttentionManager).can_capture()
