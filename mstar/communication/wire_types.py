@@ -40,6 +40,7 @@ from mstar.utils.ipc_format import (
     EnableMetrics,
     FailRequests,
     InputSignals,
+    InstanceFailed,
     MessageBody,
     NewRequest,
     NewRequestConductor,
@@ -81,6 +82,7 @@ _TYPES: dict[str, type] = {
     "new_request_conductor": NewRequestConductor,
     "reads_done": ReadsDone,
     "fail_requests": FailRequests,
+    "instance_failed": InstanceFailed,
     "worker_status": WorkerStatus,
     "enable_metrics": EnableMetrics,
     # api-server bodies

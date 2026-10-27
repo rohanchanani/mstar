@@ -28,6 +28,7 @@ from mstar.utils.ipc_format import (
     ConductorMessageType,
     FailRequests,
     InputSignals,
+    InstanceFailed,
     NewRequest,
     ScheduleTPNode,
     StopLoops,
@@ -754,3 +755,12 @@ def test_per_pass_kv_publish_info_takes_the_typed_path():
         assert extensions(msgpack.unpackb(frame, raw=False, strict_map_key=False)) == 0
         got = decode(frame).body.request_info.resource_publish_info["kv"].info[0]["kv"]
         assert got == seq
+
+
+def test_instance_failure_is_a_typed_roundtrip():
+    msg = ConductorMessage(
+        ConductorMessageType.INSTANCE_FAILED,
+        InstanceFailed("worker_1", "decoder", "collective failed"),
+    )
+    assert roundtrip(msg) == msg
+    assert _TYPE_TO_TAG[InstanceFailed] == "instance_failed"

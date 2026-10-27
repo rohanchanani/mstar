@@ -32,6 +32,7 @@ from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
+    InstanceFailed,
     NewRequestConductor,
     SetupDone,
 )
@@ -457,3 +458,39 @@ def test_dynamo_worker_exits_nonzero_when_conductor_dies():
     ):
         dynamo_worker.main(argv)
     assert exc.value.code == 1
+
+
+def test_explicit_instance_failure_stops_the_deployment_without_waiting_for_death(monkeypatch):
+    from mstar.runtime_extensions import BackendFatalError
+
+    c = _conductor([_Proc(11), _Proc(12)])
+    # Deliver the fatal event in the serving loop, with both workers alive.
+    c._wait_for_workers_ready = lambda: None
+    c.enable_nvtx = False
+    c.communicator.get_all_new_messages = _inbox([
+        ConductorMessage(
+            message_type=ConductorMessageType.INSTANCE_FAILED,
+            body=InstanceFailed("worker_1", "decoder", "collective failed"),
+        ),
+    ])
+    monkeypatch.setattr("mstar.conductor.conductor.freeze_after_setup", lambda _: None)
+    monkeypatch.setattr(time, "sleep", lambda _: pytest.fail("fatal event was retried"))
+    c.requests = {"r": _request_data(["worker_0", "worker_1"])}
+    with pytest.raises(BackendFatalError, match="decoder"):
+        c.run()
+    assert _failed(c)["r"].status == 503
+
+
+
+def test_instance_failure_during_startup_does_not_wait_for_setup(monkeypatch):
+    from mstar.runtime_extensions import BackendFatalError
+
+    c = _conductor([_Proc(11)], [ConductorMessage(
+        message_type=ConductorMessageType.INSTANCE_FAILED,
+        body=InstanceFailed("worker_0", "decoder", "setup collective failed"),
+    )])
+    monkeypatch.setattr(time, "sleep", lambda _: pytest.fail("fatal setup was retried"))
+    c.waiting_queue = [_queued("waiting")]
+    with pytest.raises(BackendFatalError, match="setup collective failed"):
+        c._wait_for_workers_ready()
+    assert _failed(c)["waiting"].status == 503

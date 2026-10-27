@@ -41,6 +41,7 @@ from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.runtime_extensions import BackendFatalError
 from mstar.utils import knobs
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
@@ -846,6 +847,13 @@ class Conductor:
             f"{describe_exitcode(p.exitcode)}, so the server is shutting down"
         )
         raise DeadWorkerError(worker_id, p.pid, p.exitcode)
+
+    def _instance_failed(self, body) -> None:
+        message = f"worker {body.worker_id}, node {body.node_name}: {body.error}"
+        logger.error("INSTANCE_FATAL: %s; stopping deployment", message)
+        self._fail_all_requests(message)
+        raise BackendFatalError(message)
+
 
     def _fail_all_requests(self, error_message: str, status: int = 503) -> None:
         """Notify the client of every request still awaiting a result, bypassing
@@ -1920,6 +1928,8 @@ class Conductor:
             for message in self.communicator.get_all_new_messages():
                 if message.message_type == ConductorMessageType.SETUP_DONE:
                     pending.discard(message.body.worker_id)
+                elif message.message_type == ConductorMessageType.INSTANCE_FAILED:
+                    self._instance_failed(message.body)
                 else:
                     self._startup_message_backlog.append(message)
             if pending:
@@ -1938,6 +1948,8 @@ class Conductor:
             self._abort_request(message.body.request_id)
         elif message.message_type == ConductorMessageType.FAIL_REQUESTS:
             self._fail_requests(message.body)
+        elif message.message_type == ConductorMessageType.INSTANCE_FAILED:
+            self._instance_failed(message.body)
         elif message.message_type == ConductorMessageType.READS_DONE:
             self._handle_reads_done(message.body)
         elif message.message_type == ConductorMessageType.WORKER_STATUS:
@@ -2068,6 +2080,8 @@ class Conductor:
                 for message in startup_backlog + self.communicator.get_all_new_messages():
                     try:
                         self._route_message(message, done_partition_forwards)
+                    except BackendFatalError:
+                        raise
                     except Exception as exc:
                         step = f"handling {_message_name(message)}"
                         for request_id in _message_request_ids(message):
@@ -2102,6 +2116,8 @@ class Conductor:
                 if self._status_interval_s is not None:
                     self._maybe_send_status()
 
+            except BackendFatalError:
+                raise
             except Exception:
                 logger.exception("Conductor error in main loop")
             finally:

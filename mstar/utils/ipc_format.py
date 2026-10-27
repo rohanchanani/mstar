@@ -224,6 +224,7 @@ class ConductorMessageType(Enum):
     SETUP_DONE = "setup_done"
     ABORT_REQUEST = "abort_request"
     FAIL_REQUESTS = "fail_requests"
+    INSTANCE_FAILED = "instance_failed"
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
@@ -291,6 +292,13 @@ class FailRequests(MessageBody):
     step can fail several of them for different reasons.
     """
     errors: dict[str, str]
+
+
+@dataclass
+class InstanceFailed(MessageBody):
+    worker_id: str
+    node_name: str
+    error: str
 
 
 @dataclass
