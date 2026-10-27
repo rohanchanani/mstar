@@ -451,6 +451,9 @@ class StepRunner:
             t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
+            except Exception:
+                self._unwind(step, [*covered, *admitted, key])
+                raise
             finally:
                 if t0 is not None:
                     phase_end(f"res.admit.{key}", t0)
@@ -477,6 +480,9 @@ class StepRunner:
         # reverse dependency order, off a list so every rank unwinds alike
         for key in reversed(keys):
             self._resources[key].rollback_admit(step.get(key), step.ctx)
+        # Released reservations cannot license skipping admission or replaying
+        # the canceled addresses on a later identical step.
+        self.clear_preplan()
 
     def plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan in dependency order
@@ -531,7 +537,6 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 self._unwind(step, [*admitted, key])
-                self._pre_admitted = None
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
@@ -558,6 +563,13 @@ class StepRunner:
                     range_pop()
         self._staged = self._step_key(step)
         return results
+
+    def accept_results(self, step: SubmoduleStep, results: Mapping[str, Any]) -> None:
+        """Consume physical results before the existing commit phase."""
+        for key, result in results.items():
+            # The result must belong to a resource this invocation declared.
+            step.steps[key]
+            self._resources[key].accept_result(result, step.ctx)
 
     def commit(self, step: SubmoduleStep) -> None:
         """record step consumption"""
